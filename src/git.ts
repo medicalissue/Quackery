@@ -98,6 +98,10 @@ export class GitWorkspaceManager {
     return record
   }
 
+  boundaryRoot(nodeId: string): string {
+    return `.quack/contracts/${safeName(this.runId)}/${safeName(nodeId)}`
+  }
+
   async head(nodeId: string): Promise<string> {
     return git(this.get(nodeId).path, ["rev-parse", "HEAD"])
   }
@@ -117,6 +121,14 @@ export class GitWorkspaceManager {
       message,
     ])
     return git(worktree, ["rev-parse", "HEAD"])
+  }
+
+  async stashUncommitted(nodeId: string, message: string): Promise<boolean> {
+    const worktree = this.get(nodeId).path
+    const status = await git(worktree, ["status", "--porcelain=v1", "--untracked-files=all"])
+    if (!status) return false
+    await git(worktree, ["stash", "push", "--include-untracked", "-m", message])
+    return true
   }
 
   async changedPaths(nodeId: string, baseCommit: string, headCommit?: string): Promise<string[]> {

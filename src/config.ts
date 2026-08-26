@@ -44,7 +44,8 @@ export const quackConfigSchema = z.object({
   limits: z.object({
     maxDepth: z.number().int().min(1).max(12).default(6),
     maxNodes: z.number().int().min(1).max(128).default(32),
-  }).strict().default({ maxDepth: 6, maxNodes: 32 }),
+    maxNeedsNurseBounces: z.number().int().min(0).max(3).default(1),
+  }).strict().default({ maxDepth: 6, maxNodes: 32, maxNeedsNurseBounces: 1 }),
 }).strict()
 
 export type QuackConfig = z.infer<typeof quackConfigSchema>

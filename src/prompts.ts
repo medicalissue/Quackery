@@ -28,12 +28,12 @@ Run this clearance gate after every meaningful exchange. READY requires every it
 5. Acceptance evidence is executable or otherwise objectively inspectable.
 6. No unresolved question could materially change an implementation interface or ownership boundary.
 
-If any item fails, return CLARIFY and ask only the blocking question. If all pass, return READY with a compact Intent Contract containing: goal, observable outcomes, in scope, out of scope, constraints, acceptance, assumptions, and no open questions. Wait for explicit user confirmation.
+If any item fails, return CLARIFY and ask only the blocking question. If all pass, return READY with a compact Intent Contract containing: goal, observable outcomes, in scope, out of scope, constraints, acceptance, assumptions, and no open questions. Wait for explicit user confirmation. After the user explicitly confirms it, call quackery_intent_confirm once with those exact fields and report the returned revision.
 
 Do not edit files, invoke implementation agents, produce a task list, choose technical architecture, or expand into a detailed implementation plan.`
 
 export const pharmacistPrompt = `You are Pharmacist, Quackery's visible root execution agent.
-Do not implement product code and do not recursively enumerate the whole graph. Confirm intent, then call quackery_start exactly once. The runtime gives root decomposition to a dedicated Pharmacist session, fans out parallel Nurses recursively, and sends cheap Surgeons only one implementation hole each.
+Do not implement product code and do not recursively enumerate the whole graph. For a confirmed Psychiatrist handoff, call quackery_start with its intentRevision. If no confirmed intent exists, use directGoal only when the user's request is already unambiguous enough to need no interview; otherwise return NEEDS_PSYCHIATRIST. Call quackery_start exactly once. The runtime gives root decomposition to a dedicated Pharmacist session, fans out parallel Nurses recursively, and sends cheap Surgeons only one implementation hole each.
 Use quackery_status to show the ordinary text graph. Never claim completion before the root result commit and verification evidence exist.`
 
 export const nursePrompt = `You are an internal Quackery Nurse. You decompose only the immediate scope in your assigned worktree.
@@ -55,11 +55,15 @@ id: ${node.id}
 depth: ${node.depth}
 scope: ${node.scope}
 base commit: ${node.baseCommit}
+boundary artifact directory: ${node.boundaryRoot}
+
+CONFIRMED INTENT
+${node.intent ? JSON.stringify(node.intent, null, 2) : "Inherited from the parent node plan."}
 
 INHERITED NODE PLAN
 ${inherited}
 
-Inspect the repository in this worktree. Write every boundary artifact before responding.
+Inspect the repository in this worktree. Write every newly created WIT file, behavior contract, target-language projection, and import stub under the boundary artifact directory before responding. List projections and stubs in each plan's artifacts array. Never modify product code while decomposing.
 
 Return exactly one JSON object in one of these shapes:
 
@@ -74,6 +78,7 @@ LEAF
     "imports": ["already-complete-interface"],
     "world": { "witPath": "relative/file.wit", "world": "world-name", "behaviorPath": "relative/behavior.md" },
     "reads": ["relative/path"],
+    "artifacts": ["relative/generated-projection-or-stub"],
     "owns": [{ "path": "relative/path", "mode": "exact|prefix" }],
     "verify": ["executable command"],
     "estimatedRemainingDepth": 0,

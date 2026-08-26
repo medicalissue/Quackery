@@ -1,5 +1,6 @@
 import type {
   DecompositionDecision,
+  GraphNodeState,
   NodeContext,
   NodePlan,
   NodeResult,
@@ -18,6 +19,7 @@ import {
 export interface RuntimeLimits {
   maxDepth: number
   maxNodes: number
+  maxNeedsNurseBounces: number
 }
 
 export interface RuntimePolicy extends BalancePolicy, RuntimeLimits {}
@@ -27,11 +29,13 @@ export interface ExecutionAdapter {
   commitBoundary(node: NodeContext, decision: DecompositionDecision): Promise<string>
   forkChild(parent: NodeContext, boundaryCommit: string, plan: NodePlan): Promise<NodeContext>
   runLeaf(node: NodeContext, boundaryCommit: string): Promise<NodeResult>
+  prepareNeedsNurse(node: NodeContext): Promise<void>
   join(node: NodeContext, boundaryCommit: string, children: NodeSuccess[], decision: SplitDecision): Promise<NodeResult>
 }
 
 export class RecursiveRuntime {
   private nodeCount = 1
+  private readonly needsNurseBounces = new Map<string, number>()
 
   constructor(
     readonly graph: RunGraph,
@@ -46,20 +50,13 @@ export class RecursiveRuntime {
     return result
   }
 
-  private async executeNode(node: NodeContext): Promise<NodeResult> {
+  private async executeNode(node: NodeContext, forceDecompose = false): Promise<NodeResult> {
     if (node.depth > this.policy.maxDepth) {
       return this.failed(node, `Maximum graph depth ${this.policy.maxDepth} exceeded`)
     }
 
-    if (node.plan?.kind === "leaf") {
-      this.graph.transition(node.id, "implementing")
-      try {
-        const result = await this.adapter.runLeaf(node, node.baseCommit)
-        this.recordResult(node, result)
-        return result
-      } catch (error) {
-        return this.failed(node, "Surgeon execution failed", error)
-      }
+    if (node.plan?.kind === "leaf" && !forceDecompose) {
+      return this.executeLeaf(node, node.baseCommit)
     }
 
     this.graph.transition(node.id, "decomposing")
@@ -100,20 +97,13 @@ export class RecursiveRuntime {
 
     if (decision.kind === "leaf") {
       node.plan = decision.leaf
-      this.graph.transition(node.id, "implementing", {
+      return this.executeLeaf(node, boundaryCommit, {
         estimatedRemainingDepth: decision.leaf.estimatedRemainingDepth,
         estimatedWork: decision.leaf.estimatedWork,
       })
-      try {
-        const result = await this.adapter.runLeaf(node, boundaryCommit)
-        this.recordResult(node, result)
-        return result
-      } catch (error) {
-        return this.failed(node, "Surgeon execution failed", error)
-      }
     }
 
-    const childContexts: NodeContext[] = []
+    const childPromises: Promise<NodeResult>[] = []
     try {
       for (const plan of decision.children) {
         if (this.nodeCount >= this.policy.maxNodes) {
@@ -121,14 +111,18 @@ export class RecursiveRuntime {
         }
         this.nodeCount += 1
         const child = await this.adapter.forkChild(node, boundaryCommit, plan)
-        childContexts.push(child)
         this.graph.add(child)
+        // Start a child as soon as its worktree is ready. The next worktree may
+        // still be created sequentially for Git safety without becoming a
+        // decomposition barrier for this child.
+        childPromises.push(this.executeNode(child))
       }
     } catch (error) {
+      await Promise.allSettled(childPromises)
       return this.failed(node, "Child worktree creation failed", error)
     }
 
-    const childResults = await Promise.all(childContexts.map((child) => this.executeNode(child)))
+    const childResults = await Promise.all(childPromises)
     const failed = childResults.find((result) => !result.ok)
     if (failed && !failed.ok) {
       return this.failed(node, `Child ${failed.nodeId} failed: ${failed.reason}`)
@@ -145,6 +139,7 @@ export class RecursiveRuntime {
       plan: integrationPlan,
       worktree: node.worktree,
       baseCommit: boundaryCommit,
+      boundaryRoot: node.boundaryRoot,
     } : undefined
     if (integrationNode) {
       this.graph.add(integrationNode)
@@ -174,6 +169,38 @@ export class RecursiveRuntime {
       }
       return this.failed(node, "Recursive join failed", error)
     }
+  }
+
+  private async executeLeaf(
+    node: NodeContext,
+    boundaryCommit: string,
+    patch: Partial<GraphNodeState> = {},
+  ): Promise<NodeResult> {
+    this.graph.transition(node.id, "implementing", {
+      ...patch,
+    })
+    let result: NodeResult
+    try {
+      result = await this.adapter.runLeaf(node, boundaryCommit)
+    } catch (error) {
+      return this.failed(node, "Surgeon execution failed", error)
+    }
+    if (!result.ok && result.reason === "NEEDS_NURSE") {
+      const bounces = this.needsNurseBounces.get(node.id) ?? 0
+      if (bounces < this.policy.maxNeedsNurseBounces) {
+        try {
+          await this.adapter.prepareNeedsNurse(node)
+        } catch (error) {
+          return this.failed(node, "Failed to preserve Surgeon attempt before Nurse bounce", error)
+        }
+        this.needsNurseBounces.set(node.id, bounces + 1)
+        node.role = "nurse"
+        this.graph.transition(node.id, "decomposing", { role: "nurse" })
+        return this.executeNode(node, true)
+      }
+    }
+    this.recordResult(node, result)
+    return result
   }
 
   private validateSplit(node: NodeContext, decision: SplitDecision): void {

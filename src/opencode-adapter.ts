@@ -1,11 +1,12 @@
 import { access } from "node:fs/promises"
+import { relative } from "node:path"
 import { z } from "zod"
 import type { DecompositionDecision, NodeContext, NodePlan, NodeResult, NodeSuccess, SplitDecision } from "./model.js"
 import { decompositionDecisionSchema } from "./model.js"
 import { addUsage, boundaryCacheSeed, cacheContext, emptyUsage, usageFromResponse, type BoundaryCacheSeed } from "./cache.js"
 import type { ExecutionAdapter } from "./runtime.js"
 import { GitWorkspaceManager } from "./git.js"
-import { assertNodeWorldMatchesWit, resolveRepositoryPath } from "./validation.js"
+import { assertNodeWorldMatchesWit, ownershipContains, resolveRepositoryPath } from "./validation.js"
 import { decompositionPrompt, implementationPrompt, integrationPrompt } from "./prompts.js"
 
 const implementationResponseSchema = z.discriminatedUnion("kind", [
@@ -51,7 +52,7 @@ export interface OpenCodeAdapterOptions {
   client: Client
   git: GitWorkspaceManager
   parentSessionId: string
-  authorizeSession(sessionId: string, node: NodeContext): void
+  authorizeSession(sessionId: string, node: NodeContext, agent: "pharmacist" | "nurse" | "surgeon"): void
   cache: {
     enabled: boolean
     minFanout: number
@@ -82,9 +83,13 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     for (const plan of plans) {
       await assertNodeWorldMatchesWit(node.worktree, plan)
       await access(resolveRepositoryPath(node.worktree, plan.world.behaviorPath))
+      for (const artifact of plan.artifacts ?? []) {
+        await access(resolveRepositoryPath(node.worktree, artifact))
+      }
     }
+    this.assertBoundaryArtifactPaths(node, decision, plans)
     const commit = await this.options.git.commitAll(node.id, `quackery(${node.id}): freeze abstract worlds`)
-    if (node.plan) await this.options.git.assertOwned(node.id, node.baseCommit, node.plan.owns, commit)
+    await this.options.git.assertOwned(node.id, node.baseCommit, [{ path: node.boundaryRoot, mode: "prefix" }], commit)
     const seed = boundaryCacheSeed(node, commit, decision)
     const cacheRoles = new Set<"nurse" | "surgeon">()
     if (this.options.cache.enabled && decision.kind === "split") {
@@ -115,8 +120,14 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       plan,
       worktree: record.path,
       baseCommit: boundaryCommit,
+      boundaryRoot: this.options.git.boundaryRoot(id),
+      ...(parent.intent ? { intent: parent.intent } : {}),
       ...(cache ? { cache } : {}),
     }
+  }
+
+  async prepareNeedsNurse(node: NodeContext): Promise<void> {
+    await this.options.git.stashUncommitted(node.id, `quackery(${node.id}): Surgeon attempt before NEEDS_NURSE`)
   }
 
   async runLeaf(node: NodeContext): Promise<NodeResult> {
@@ -203,6 +214,8 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         plan: integration,
         worktree: node.worktree,
         baseCommit: integrationBase,
+        boundaryRoot: node.boundaryRoot,
+        ...(node.intent ? { intent: node.intent } : {}),
       }
       const sessionId = await this.createSession(integrationContext, "surgeon", `integration surgeon · ${node.scope}`)
       const response = await this.prompt(
@@ -288,7 +301,30 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     }
   }
 
-  private async createSession(node: NodeContext, agent: string, title: string): Promise<string> {
+  private assertBoundaryArtifactPaths(
+    node: NodeContext,
+    decision: DecompositionDecision,
+    plans: NodePlan[],
+  ): void {
+    // A non-root LEAF must reuse its inherited world. SPLITs and root LEAFs
+    // create new boundary artifacts only in this node's reserved namespace.
+    if (decision.kind === "leaf" && node.plan) return
+    const boundary = { path: node.boundaryRoot, mode: "prefix" as const }
+    for (const plan of plans) {
+      for (const path of [plan.world.witPath, plan.world.behaviorPath, ...(plan.artifacts ?? [])]) {
+        const candidate = relative(node.worktree, resolveRepositoryPath(node.worktree, path)).replaceAll("\\", "/")
+        if (!ownershipContains(boundary, candidate)) {
+          throw new Error(`Boundary artifact ${candidate} must be under ${node.boundaryRoot}`)
+        }
+      }
+    }
+  }
+
+  private async createSession(
+    node: NodeContext,
+    agent: "pharmacist" | "nurse" | "surgeon",
+    title: string,
+  ): Promise<string> {
     // A Surgeon spawned after this node's Nurse must be a child of that Nurse.
     // A direct leaf has no local decomposition session, so it remains a child
     // of the parent node's decomposer (or the user's originating session).
@@ -304,7 +340,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     const data = dataOf(response)
     const sessionId = data?.id
     if (typeof sessionId !== "string") throw new Error(`OpenCode did not return a session id for ${node.id}`)
-    this.options.authorizeSession(sessionId, node)
+    this.options.authorizeSession(sessionId, node, agent)
     return sessionId
   }
 

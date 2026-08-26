@@ -18,6 +18,7 @@
 
   "limits": {
     "maxDepth": 6,
-    "maxNodes": 32
+    "maxNodes": 32,
+    "maxNeedsNurseBounces": 1
   }
 }

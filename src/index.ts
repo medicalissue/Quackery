@@ -6,6 +6,7 @@ import { cachePartitionKey } from "./cache.js"
 import { configuredRoleModel, loadQuackConfig, type ModelRole, type QuackConfig, type ResolvedRoleModel } from "./config.js"
 import { pharmacistPrompt, psychiatristPrompt, nursePrompt, surgeonPrompt } from "./prompts.js"
 import { RunRegistry } from "./registry.js"
+import { IntentRegistry } from "./intent.js"
 import { ownershipContains } from "./validation.js"
 
 function toolPaths(toolName: string, args: Record<string, unknown>): string[] {
@@ -46,6 +47,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
       permission: {
         edit: "deny",
         task: "deny",
+        "quackery_intent_confirm": "allow",
         bash: {
           "*": "deny",
           "git status*": "allow",
@@ -62,7 +64,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
       mode: "primary",
       prompt: pharmacistPrompt,
       permission: {
-        edit: "deny",
+        edit: "allow",
         bash: "deny",
         task: "deny",
         "quackery_*": "allow",
@@ -134,13 +136,22 @@ function renderModelRouting(config: QuackConfig, routing: Record<ModelRole, Reso
 export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => {
   const quack = await loadQuackConfig(directory, options)
   const registry = new RunRegistry()
-  const authorizedSessions = new Map<string, NodeContext>()
+  const intents = new IntentRegistry()
+  const authorizedSessions = new Map<string, {
+    node: NodeContext
+    agent: "pharmacist" | "nurse" | "surgeon"
+  }>()
+  const pharmacistSessions = new Set<string>()
   let effectiveModels = Object.fromEntries(
     modelRoles.map((role) => [role, configuredRoleModel(quack, role)]),
   ) as Record<ModelRole, ResolvedRoleModel>
 
-  const authorizeSession = (sessionId: string, node: NodeContext): void => {
-    authorizedSessions.set(sessionId, node)
+  const authorizeSession = (
+    sessionId: string,
+    node: NodeContext,
+    agent: "pharmacist" | "nurse" | "surgeon",
+  ): void => {
+    authorizedSessions.set(sessionId, { node, agent })
   }
 
   return {
@@ -149,13 +160,16 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
     },
 
     "chat.message": async (input) => {
+      if (input.agent === "pharmacist" && !authorizedSessions.has(input.sessionID)) {
+        pharmacistSessions.add(input.sessionID)
+      }
       if ((input.agent === "nurse" || input.agent === "surgeon") && !authorizedSessions.has(input.sessionID)) {
         throw new Error(`${input.agent} is internal to the Quackery runtime and cannot be invoked directly`)
       }
     },
 
     "chat.params": async (input, output) => {
-      const node = authorizedSessions.get(input.sessionID)
+      const node = authorizedSessions.get(input.sessionID)?.node
       if (!node?.cache || quack.cache.mode === "off") return
       if (input.model.providerID === "openai" || input.provider.options.setCacheKey === true) {
         const role = node.role === "integration-surgeon" ? "surgeon" : node.role
@@ -171,43 +185,96 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
 
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID || quack.cache.mode === "off") return
-      const node = authorizedSessions.get(input.sessionID)
+      const node = authorizedSessions.get(input.sessionID)?.node
       if (node?.cache) output.system.push(node.cache.prefix)
     },
 
     "tool.execute.before": async (input, output) => {
-      const node = authorizedSessions.get(input.sessionID)
-      if (!node?.plan || !["write", "edit", "apply_patch"].includes(input.tool)) return
+      if (!["write", "edit", "apply_patch"].includes(input.tool)) return
+      const authorized = authorizedSessions.get(input.sessionID)
+      if (!authorized) {
+        if (pharmacistSessions.has(input.sessionID)) {
+          throw new Error("Visible Pharmacist cannot edit files; only its isolated runtime session may write boundaries")
+        }
+        return
+      }
+      const { node, agent } = authorized
       const paths = toolPaths(input.tool, output.args as Record<string, unknown>)
       if (paths.length === 0) throw new Error(`Cannot resolve target paths for ${input.tool}`)
       for (const path of paths) {
         const candidate = repositoryRelativePath(node, path)
-        if (!node.plan.owns.some((rule) => ownershipContains(rule, candidate))) {
-          throw new Error(`Node ${node.id} does not own ${candidate}`)
+        const allowed = agent === "surgeon"
+          ? node.plan?.owns.some((rule) => ownershipContains(rule, candidate)) === true
+          : ownershipContains({ path: node.boundaryRoot, mode: "prefix" }, candidate)
+        if (!allowed) {
+          throw new Error(
+            agent === "surgeon"
+              ? `Node ${node.id} does not own ${candidate}`
+              : `Decomposer ${node.id} may write only under ${node.boundaryRoot}, not ${candidate}`,
+          )
         }
       }
     },
 
     tool: {
+      quackery_intent_confirm: tool({
+        description: "Persist the Intent Contract after explicit user confirmation. Psychiatrist only.",
+        args: {
+          goal: tool.schema.string().min(1),
+          observableOutcomes: tool.schema.array(tool.schema.string().min(1)).min(1),
+          inScope: tool.schema.array(tool.schema.string().min(1)).default([]),
+          outOfScope: tool.schema.array(tool.schema.string().min(1)).default([]),
+          constraints: tool.schema.array(tool.schema.string().min(1)).default([]),
+          acceptance: tool.schema.array(tool.schema.string().min(1)).min(1),
+          assumptions: tool.schema.array(tool.schema.string().min(1)).default([]),
+        },
+        async execute(args, context) {
+          if (context.agent !== "psychiatrist") throw new Error("Only Psychiatrist can confirm an Intent Contract")
+          const intent = await intents.confirm(context.directory, context.sessionID, "psychiatrist", args)
+          return {
+            title: `Intent ${intent.revision}`,
+            output: `Confirmed ${intent.revision} at ${intent.repositoryBase.slice(0, 7)}. Pharmacist can now consume this revision.`,
+            metadata: { revision: intent.revision, repositoryBase: intent.repositoryBase },
+          }
+        },
+      }),
+
       quackery_start: tool({
         description: "Start a background Quackery run. Pharmacist calls this once after intent is fixed.",
         args: {
-          goal: tool.schema.string().min(1),
+          intentRevision: tool.schema.string().min(1).optional(),
+          directGoal: tool.schema.string().min(1).optional(),
           maxDepth: tool.schema.number().int().min(1).max(12).optional(),
           maxNodes: tool.schema.number().int().min(1).max(128).optional(),
         },
         async execute(args, context) {
           if (context.agent !== "pharmacist") throw new Error("Only Pharmacist can start Quackery")
+          if (args.intentRevision && args.directGoal) {
+            throw new Error("Choose a confirmed intentRevision or a directGoal, not both")
+          }
+          const intent = args.directGoal
+            ? await intents.confirm(context.directory, context.sessionID, "pharmacist-direct", {
+                goal: args.directGoal,
+                observableOutcomes: [],
+                inScope: [],
+                outOfScope: [],
+                constraints: [],
+                acceptance: [],
+                assumptions: ["Direct Pharmacist request; no Psychiatrist interview was required"],
+              })
+            : await intents.resolve(context.directory, context.sessionID, args.intentRevision)
           const handle = await registry.start({
             directory: context.directory,
             sessionId: context.sessionID,
-            goal: args.goal,
+            goal: intent.goal,
+            intent,
             client,
             authorizeSession,
             policy: {
               ...quack.balance,
               maxDepth: args.maxDepth ?? quack.limits.maxDepth,
               maxNodes: args.maxNodes ?? quack.limits.maxNodes,
+              maxNeedsNurseBounces: quack.limits.maxNeedsNurseBounces,
             },
             cache: {
               enabled: quack.cache.mode === "auto",

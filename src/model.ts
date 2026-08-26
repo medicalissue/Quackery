@@ -1,4 +1,5 @@
 import { z } from "zod"
+import type { ConfirmedIntent } from "./intent.js"
 
 export const ownershipRuleSchema = z.object({
   path: z.string().min(1),
@@ -23,6 +24,7 @@ export const nodePlanSchema = z.object({
   imports: z.array(z.string().min(1)),
   world: worldRefSchema,
   reads: z.array(z.string().min(1)).default([]),
+  artifacts: z.array(z.string().min(1)).optional(),
   owns: z.array(ownershipRuleSchema).min(1),
   verify: z.array(z.string().min(1)).min(1),
   estimatedRemainingDepth: z.number().int().min(0),
@@ -94,7 +96,9 @@ export interface NodeContext {
   worktree: string
   baseCommit: string
   boundaryCommit?: string
+  boundaryRoot: string
   cache?: CacheContext
+  intent?: ConfirmedIntent
 }
 
 export type NodeStatus =

@@ -27,6 +27,7 @@ function root(): NodeContext {
     scope: "feature",
     worktree: "/tmp/a-worktree-that-must-not-enter-the-key",
     baseCommit: "base",
+    boundaryRoot: ".quack/contracts/test/root",
   }
 }
 

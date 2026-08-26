@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import type { NodeContext, NodeResult } from "./model.js"
+import type { ConfirmedIntent } from "./intent.js"
 import { RunGraph } from "./graph.js"
 import { git, GitWorkspaceManager, repositoryRoot } from "./git.js"
 import { OpenCodeExecutionAdapter } from "./opencode-adapter.js"
@@ -23,7 +24,8 @@ export interface StartRunInput {
   sessionId: string
   goal: string
   client: Client
-  authorizeSession(sessionId: string, node: NodeContext): void
+  authorizeSession(sessionId: string, node: NodeContext, agent: "pharmacist" | "nurse" | "surgeon"): void
+  intent: ConfirmedIntent
   policy?: Partial<RuntimePolicy>
   cache?: {
     enabled: boolean
@@ -34,6 +36,7 @@ export interface StartRunInput {
 const defaultPolicy: RuntimePolicy = {
   maxDepth: 6,
   maxNodes: 32,
+  maxNeedsNurseBounces: 1,
   maxDepthSkew: 1,
   maxWorkRatio: 2,
   allowJustifiedImbalance: true,
@@ -60,6 +63,8 @@ export class RunRegistry {
       scope: input.goal,
       worktree: rootRecord.path,
       baseCommit: invocationBase,
+      boundaryRoot: manager.boundaryRoot("root"),
+      intent: input.intent,
     }
     const graph = new RunGraph({ id, repository, root, invocationBase })
     const adapter = new OpenCodeExecutionAdapter({

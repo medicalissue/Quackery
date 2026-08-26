@@ -30,7 +30,7 @@ test("loads JSONC config with local overrides and profile role defaults", async 
     })
 
     expect(config.profile).toBe("balanced")
-    expect(config.limits).toEqual({ maxDepth: 7, maxNodes: 12 })
+    expect(config.limits).toEqual({ maxDepth: 7, maxNodes: 12, maxNeedsNurseBounces: 1 })
     expect(configuredRoleModel(config, "psychiatrist")).toMatchObject({ tier: "frontier", model: "shared/frontier" })
     expect(configuredRoleModel(config, "nurse")).toMatchObject({ tier: "strong", source: "inherit" })
     expect(configuredRoleModel(config, "surgeon")).toMatchObject({

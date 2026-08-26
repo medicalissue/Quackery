@@ -167,6 +167,8 @@ READY   → Intent Contract를 제시하고 사용자 확인을 기다린다
 
 확인된 Intent Contract는 plugin-owned state에 revisioned artifact로 저장된다. Psychiatrist가 Pharmacist를 자동 호출하거나 mode를 강제로 전환하지 않는다. 사용자가 `Tab` 또는 `Shift+Tab`으로 Pharmacist를 직접 선택한다.
 
+사용자가 명시적으로 확인하면 Psychiatrist는 `quackery_intent_confirm`으로 contract를 `.git/quackery/intents/`에 저장한다. Artifact는 repository base, OpenCode session, source와 immutable revision을 포함하고 `latest` pointer와 이전 revision을 모두 보존한다. Pharmacist는 `intentRevision`을 지정하거나 같은 session의 latest confirmed revision을 소비한다. Repository HEAD가 contract base에서 이동했으면 실행하지 않고 재확인을 요구한다.
+
 ### 5.3 Pharmacist: selectable execution mode
 
 Pharmacist는 사용자-facing execution agent이자 유일한 root decomposer다. 선택되면 현재 repository와 session에 연결된 최신 confirmed Intent Contract를 우선 사용한다. Contract가 없다면 명확한 요청에 한해 최소 Intent Contract를 고정할 수 있지만, 결과를 바꿀 모호함이 남아 있으면 인터뷰를 흉내 내지 않고 `NEEDS_PSYCHIATRIST`를 반환한다.
@@ -326,6 +328,8 @@ t3  Surgeon A1, A2, C 구현 계속
 ```
 
 먼저 원자화된 branch가 먼저 구현된다.
+
+Runtime은 Git worktree 생성 자체는 repository lock 안전성을 위해 순서대로 수행할 수 있지만, 이미 worktree가 준비된 child의 `executeNode`를 다음 sibling worktree 생성이 끝날 때까지 미루지 않는다. 즉 worktree creation loop가 숨은 fan-out barrier가 되어서는 안 된다.
 
 ### 6.4 Execution tree and world wiring graph
 
@@ -755,6 +759,8 @@ join 전       commit, WIT world revision과 ownership 재검사
 
 Shell, formatter, code generator 또는 test command가 소유하지 않은 tracked file을 수정하면 node를 즉시 실패 처리하고 그 commit을 merge하지 않는다. 해당 worktree는 evidence를 위해 보존할 수 있지만 sibling이나 user checkout에는 영향이 없다. Ignored build output과 runtime scratch는 patch ownership 대상이 아니며 result commit에 포함될 수 없다.
 
+Pharmacist와 Nurse decomposition session은 product ownership에 쓸 수 없다. 새 WIT, behavior contract, projection과 stub은 runtime이 node별로 예약한 `.quack/contracts/<run>/<node>/` 아래에만 작성한다. Visible Pharmacist의 일반 conversation session은 edit을 거부하며, runtime-authorized isolated session만 이 boundary namespace에 쓸 수 있다. Boundary commit에 namespace 밖 변경이 하나라도 포함되면 child를 spawn하지 않는다.
+
 ### 11.5 Recovery and cleanup
 
 Quackery는 user branch에 force push, hard reset 또는 implicit stash를 수행하지 않는다. 실패한 subtree의 branch와 last commit은 run metadata에 기록한다. 성공한 join과 사용자가 적용한 result만 확인한 뒤 임시 worktree를 정리한다. Cleanup 실패는 구현 성공과 구분해 보고하며 recoverable branch를 먼저 보존한다.
@@ -833,6 +839,8 @@ kind: needs-nurse
 reason: "상태 전이와 persistence가 현재 scope에서 과도하게 결합됨"
 ```
 
+Runtime은 Surgeon의 미완성 working-tree 변경을 recoverable Git stash로 보존한 뒤 같은 node를 Nurse에게 다시 전달한다. Sibling subtree는 취소하거나 재실행하지 않는다. 재분해 횟수는 `limits.maxNeedsNurseBounces`로 제한하며, 상한을 다시 넘으면 해당 subtree만 실패한다. Integration LEAF의 `NEEDS_NURSE` 재분해는 별도 join-repair semantics가 필요하므로 초기 구현 범위 밖이다.
+
 ### Contract failure
 
 Inherited WIT world 또는 behavior contract가 구현 불가능하거나 필요한 의미를 표현하지 못할 때 structured evidence를 parent로 반환한다.
@@ -859,6 +867,7 @@ Parent가 WIT world나 behavior contract를 수정하면 해당 revision에 의�
 
 - 최대 graph depth
 - 최대 node 수
+- Leaf별 `NEEDS_NURSE` 재분해 횟수
 - Node별 retry와 timeout
 - Model별 token 또는 비용 budget
 - 전체 run timeout

@@ -5,6 +5,7 @@ import { basename, join } from "node:path"
 import { tmpdir } from "node:os"
 import { promisify } from "node:util"
 import type { NodeContext } from "../src/model.js"
+import type { ConfirmedIntent } from "../src/intent.js"
 import { git } from "../src/git.js"
 import { RunRegistry } from "../src/registry.js"
 
@@ -39,28 +40,42 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
         if (!directory) throw new Error(`unknown fake session ${input.path.id}`)
         sessionAgents.set(input.path.id, input.body.agent)
         if (input.body.agent === "pharmacist") {
-          await mkdir(join(directory, "contracts"), { recursive: true })
-          await writeFile(join(directory, "contracts/worlds.wit"), `
+          const node = authorized.get(input.path.id)
+          if (!node) throw new Error("pharmacist session was not authorized")
+          await mkdir(join(directory, node.boundaryRoot), { recursive: true })
+          await writeFile(join(directory, node.boundaryRoot, "worlds.wit"), `
             package quackery:fixture@0.1.0;
             interface a { value: func() -> string; }
             interface b { value: func() -> string; }
             world a-surgeon { export a; }
             world b-surgeon { import a; export b; }
           `)
-          await writeFile(join(directory, "contracts/behavior.md"), "# a\nWrite a.txt.\n\n# b\nWrite b.txt.\n")
-          await writeFile(join(directory, "contracts/a.stub.ts"), "export interface A { value(): string }\n")
+          await writeFile(join(directory, node.boundaryRoot, "behavior.md"), "# a\nWrite a.txt.\n\n# b\nWrite b.txt.\n")
+          await writeFile(join(directory, node.boundaryRoot, "a.stub.ts"), "export interface A { value(): string }\n")
+          const witPath = `${node.boundaryRoot}/worlds.wit`
+          const behaviorPath = `${node.boundaryRoot}/behavior.md`
+          const stubPath = `${node.boundaryRoot}/a.stub.ts`
           return jsonResponse({
             kind: "split",
             children: [
-              leafPlan("a", [], "a-surgeon", "a.txt"),
-              { ...leafPlan("b", ["a"], "b-surgeon", "b.txt"), kind: "scope", estimatedRemainingDepth: 1 },
+              leafPlan("a", [], "a-surgeon", "a.txt", witPath, behaviorPath, stubPath),
+              {
+                ...leafPlan("b", ["a"], "b-surgeon", "b.txt", witPath, behaviorPath, stubPath),
+                kind: "scope",
+                estimatedRemainingDepth: 1,
+              },
             ],
             join: { verify: ["test -f a.txt && test -f b.txt"] },
           })
         }
 
         if (input.body.agent === "nurse") {
-          return jsonResponse({ kind: "leaf", leaf: leafPlan("b", ["a"], "b-surgeon", "b.txt") })
+          const inherited = authorized.get(input.path.id)?.plan
+          if (!inherited) throw new Error("nurse session has no inherited plan")
+          return jsonResponse({
+            kind: "leaf",
+            leaf: { ...inherited, kind: "leaf", estimatedRemainingDepth: 0 },
+          })
         }
 
         leafStarts.push(Date.now())
@@ -78,6 +93,7 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
     directory: repository,
     sessionId: "parent-session",
     goal: "implement a and b",
+    intent: directIntent(repository, base),
     client: fakeClient,
     authorizeSession: (id, node) => authorized.set(id, node),
     policy: { allowJustifiedImbalance: false },
@@ -111,7 +127,15 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
   expect(surgeons.some((id) => sessionParents.get(id) === nurse)).toBe(true)
 })
 
-function leafPlan(id: string, imports: string[], world: string, file: string) {
+function leafPlan(
+  id: string,
+  imports: string[],
+  world: string,
+  file: string,
+  witPath: string,
+  behaviorPath: string,
+  stubPath: string,
+) {
   return {
     id,
     kind: "leaf",
@@ -119,11 +143,12 @@ function leafPlan(id: string, imports: string[], world: string, file: string) {
     exports: [id],
     imports,
     world: {
-      witPath: "contracts/worlds.wit",
+      witPath,
       world,
-      behaviorPath: "contracts/behavior.md",
+      behaviorPath,
     },
-    reads: ["contracts/a.stub.ts"],
+    reads: [stubPath],
+    artifacts: [stubPath],
     owns: [{ path: file, mode: "exact" }],
     verify: [`test -f ${file}`],
     estimatedRemainingDepth: 0,
@@ -133,4 +158,22 @@ function leafPlan(id: string, imports: string[], world: string, file: string) {
 
 function jsonResponse(value: unknown) {
   return { data: { parts: [{ type: "text", text: JSON.stringify(value) }] } }
+}
+
+function directIntent(repository: string, repositoryBase: string): ConfirmedIntent {
+  return {
+    revision: "intent-test",
+    source: "pharmacist-direct",
+    repository,
+    repositoryBase,
+    sessionId: "parent-session",
+    confirmedAt: 1,
+    goal: "implement a and b",
+    observableOutcomes: [],
+    inScope: [],
+    outOfScope: [],
+    constraints: [],
+    acceptance: [],
+    assumptions: [],
+  }
 }
