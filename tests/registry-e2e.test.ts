@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { execFile } from "node:child_process"
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
-import { basename, join } from "node:path"
+import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { promisify } from "node:util"
 import type { NodeContext } from "../src/model.js"
@@ -47,8 +47,10 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
             package quackery:fixture@0.1.0;
             interface a { value: func() -> string; }
             interface b { value: func() -> string; }
+            interface feature { value: func() -> string; }
             world a-surgeon { export a; }
             world b-surgeon { import a; export b; }
+            world feature-surgeon { import a; import b; export feature; }
           `)
           await writeFile(join(directory, node.boundaryRoot, "behavior.md"), "# a\nWrite a.txt.\n\n# b\nWrite b.txt.\n")
           await writeFile(join(directory, node.boundaryRoot, "a.stub.ts"), "export interface A { value(): string }\n")
@@ -65,7 +67,21 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
                 estimatedRemainingDepth: 1,
               },
             ],
-            join: { verify: ["test -f a.txt && test -f b.txt"] },
+            join: {
+              integration: {
+                ...leafPlan(
+                  "feature-join",
+                  ["a", "b"],
+                  "feature-surgeon",
+                  "index.txt",
+                  witPath,
+                  behaviorPath,
+                  stubPath,
+                ),
+                exports: ["feature"],
+              },
+              verify: ["test -f a.txt && test -f b.txt && test -f index.txt"],
+            },
           })
         }
 
@@ -78,8 +94,10 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
           })
         }
 
-        leafStarts.push(Date.now())
-        const leaf = basename(directory).endsWith("a") ? "a" : "b"
+        const plan = authorized.get(input.path.id)?.plan
+        const leaf = plan?.owns[0]?.path === "index.txt" ? "index" : plan?.id
+        if (leaf !== "a" && leaf !== "b" && leaf !== "index") throw new Error(`unknown leaf for ${input.path.id}`)
+        if (leaf !== "index") leafStarts.push(Date.now())
         await Bun.sleep(100)
         await writeFile(join(directory, `${leaf}.txt`), `${leaf} implemented\n`)
         return jsonResponse({ kind: "implemented", summary: `${leaf} done` })
@@ -110,11 +128,13 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
   expect(await Bun.file(join(repository, "a.txt")).exists()).toBe(false)
   expect(await git(repository, ["show", `${result.headCommit}:a.txt`])).toBe("a implemented")
   expect(await git(repository, ["show", `${result.headCommit}:b.txt`])).toBe("b implemented")
+  expect(await git(repository, ["show", `${result.headCommit}:index.txt`])).toBe("index implemented")
+  expect(await git(repository, ["ls-tree", "-r", "--name-only", result.headCommit])).not.toContain(".quack/contracts/")
   expect(await git(repository, ["rev-list", "--count", `${base}..${result.headCommit}`])).toBe("1")
   expect(handle.graph.snapshot.status).toBe("verified")
   expect(handle.graph.render()).toContain("surgeon · implement a · verified")
   expect(handle.graph.render()).toContain("nurse · implement b · verified")
-  expect(authorized.size).toBe(4)
+  expect(authorized.size).toBe(5)
 
   const pharmacist = [...sessionAgents].find(([, agent]) => agent === "pharmacist")?.[0]
   const nurse = [...sessionAgents].find(([, agent]) => agent === "nurse")?.[0]
@@ -125,6 +145,93 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
   expect(sessionParents.get(nurse!)).toBe(pharmacist)
   expect(surgeons.some((id) => sessionParents.get(id) === pharmacist)).toBe(true)
   expect(surgeons.some((id) => sessionParents.get(id) === nurse)).toBe(true)
+
+  const worktrees = handle.git.recordsSnapshot()
+  const restarted = new RunRegistry()
+  const recovered = await restarted.snapshot(repository, handle.id, "parent-session")
+  expect(recovered.status).toBe("verified")
+  expect(recovered.resultCommit).toBe(result.headCommit)
+  expect(recovered.worktrees).toHaveLength(4)
+
+  const applied = await restarted.apply(repository, handle.id, "parent-session")
+  expect(applied.status).toBe("applied")
+  expect(applied.cleanup?.failures).toEqual([])
+  expect(await readFile(join(repository, "a.txt"), "utf8")).toBe("a implemented\n")
+  expect(await readFile(join(repository, "b.txt"), "utf8")).toBe("b implemented\n")
+  expect(await readFile(join(repository, "index.txt"), "utf8")).toBe("index implemented\n")
+  expect(await git(repository, ["ls-files", ".quack/contracts"])).toBe("")
+  for (const worktree of worktrees) {
+    expect(access(worktree.path)).rejects.toThrow()
+  }
+  expect(await git(repository, ["branch", "--list", `quackery/${handle.id}/*`])).toBe("")
+})
+
+test("a direct root LEAF returns one product-only commit", async () => {
+  const repository = await mkdtemp(join(tmpdir(), "quackery-root-leaf-"))
+  await execFileAsync("git", ["init", "-q"], { cwd: repository })
+  await writeFile(join(repository, "README.md"), "fixture\n")
+  await execFileAsync("git", ["add", "README.md"], { cwd: repository })
+  await execFileAsync("git", [
+    "-c", "user.name=Test", "-c", "user.email=test@example.com",
+    "commit", "-q", "-m", "base",
+  ], { cwd: repository })
+  const base = await git(repository, ["rev-parse", "HEAD"])
+  let nextSession = 0
+  const sessions = new Map<string, string>()
+  const authorized = new Map<string, NodeContext>()
+  const fakeClient = {
+    session: {
+      async create(input: any) {
+        const id = `leaf-session-${nextSession++}`
+        sessions.set(id, input.query.directory)
+        return { data: { id } }
+      },
+      async prompt(input: any) {
+        const directory = sessions.get(input.path.id)
+        const node = authorized.get(input.path.id)
+        if (!directory || !node) throw new Error("unknown fake root-leaf session")
+        if (input.body.agent === "pharmacist") {
+          await mkdir(join(directory, node.boundaryRoot), { recursive: true })
+          await writeFile(join(directory, node.boundaryRoot, "world.wit"), `
+            package quackery:fixture@0.1.0;
+            interface feature { value: func() -> string; }
+            world feature-world { export feature; }
+          `)
+          await writeFile(join(directory, node.boundaryRoot, "behavior.md"), "# feature\n")
+          return jsonResponse({
+            kind: "leaf",
+            leaf: leafPlan(
+              "feature",
+              [],
+              "feature-world",
+              "feature.txt",
+              `${node.boundaryRoot}/world.wit`,
+              `${node.boundaryRoot}/behavior.md`,
+              `${node.boundaryRoot}/behavior.md`,
+            ),
+          })
+        }
+        await writeFile(join(directory, "feature.txt"), "implemented\n")
+        return jsonResponse({ kind: "implemented", summary: "done" })
+      },
+    },
+  }
+  const registry = new RunRegistry()
+  const handle = await registry.start({
+    directory: repository,
+    sessionId: "root-leaf-parent",
+    goal: "implement feature",
+    intent: { ...directIntent(repository, base), sessionId: "root-leaf-parent", goal: "implement feature" },
+    client: fakeClient,
+    authorizeSession: (id, node) => authorized.set(id, node),
+  })
+  const result = await handle.promise
+  expect(result.ok).toBe(true)
+  if (!result.ok) return
+  expect(await git(repository, ["rev-list", "--count", `${base}..${result.headCommit}`])).toBe("1")
+  expect(await git(repository, ["show", `${result.headCommit}:feature.txt`])).toBe("implemented")
+  expect(await git(repository, ["ls-tree", "-r", "--name-only", result.headCommit])).not.toContain(".quack/contracts/")
+  expect(await Bun.file(join(repository, "feature.txt")).exists()).toBe(false)
 })
 
 function leafPlan(

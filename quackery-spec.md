@@ -1,6 +1,6 @@
 # Quackery Specification
 
-**Status:** Draft 0.7
+**Status:** Draft 0.8
 
 **Category:** Git-native recursive parallel implementation plugin for OpenCode
 
@@ -757,13 +757,15 @@ node 종료 시  base..head changed-path 전체 검사
 join 전       commit, WIT world revision과 ownership 재검사
 ```
 
-Shell, formatter, code generator 또는 test command가 소유하지 않은 tracked file을 수정하면 node를 즉시 실패 처리하고 그 commit을 merge하지 않는다. 해당 worktree는 evidence를 위해 보존할 수 있지만 sibling이나 user checkout에는 영향이 없다. Ignored build output과 runtime scratch는 patch ownership 대상이 아니며 result commit에 포함될 수 없다.
+Agent role의 shell access는 거부한다. Agent의 구현 변경은 path-audited edit/write tool만 통과하며, verification command는 agent 응답 뒤 runtime이 구현 commit을 먼저 고정한 다음 실행한다. Verification이 tracked 또는 non-ignored untracked file을 만들거나 바꾸면 node를 실패시키고 구현 commit만 recoverable commit으로 보존한다. Ignored build output과 runtime scratch는 patch ownership 대상이 아니며 result commit에 포함될 수 없다.
 
 Pharmacist와 Nurse decomposition session은 product ownership에 쓸 수 없다. 새 WIT, behavior contract, projection과 stub은 runtime이 node별로 예약한 `.quack/contracts/<run>/<node>/` 아래에만 작성한다. Visible Pharmacist의 일반 conversation session은 edit을 거부하며, runtime-authorized isolated session만 이 boundary namespace에 쓸 수 있다. Boundary commit에 namespace 밖 변경이 하나라도 포함되면 child를 spawn하지 않는다.
 
 ### 11.5 Recovery and cleanup
 
-Quackery는 user branch에 force push, hard reset 또는 implicit stash를 수행하지 않는다. 실패한 subtree의 branch와 last commit은 run metadata에 기록한다. 성공한 join과 사용자가 적용한 result만 확인한 뒤 임시 worktree를 정리한다. Cleanup 실패는 구현 성공과 구분해 보고하며 recoverable branch를 먼저 보존한다.
+Quackery는 user branch에 force push, hard reset 또는 implicit stash를 수행하지 않는다. 실패한 subtree의 branch와 last commit은 run metadata에 기록한다. Graph snapshot은 atomic rename으로 저장하며 process restart 뒤 verified result의 status와 apply를 복구할 수 있다. Process와 함께 중단된 in-flight run은 자동으로 이어서 model session을 호출하지 않고 `interrupted`로 표시하며 branch와 worktree를 보존한다.
+
+성공한 result를 사용자가 적용한 뒤 임시 worktree와 run branch를 정리한다. Cleanup 실패는 구현 성공과 구분해 snapshot에 기록하고, 이미 적용된 run에 `quackery_apply`를 다시 호출하면 남은 cleanup만 재시도한다. 최종 result commit은 실행용 `.quack/contracts/<run>/`을 invocation base 상태로 되돌려 product diff만 포함한다.
 
 ### 11.6 `.quack` project policy and runtime state
 
@@ -778,7 +780,7 @@ Repository-local Quackery configuration은 `.quack/`에 둔다.
 
 설정 우선순위는 plugin options, tracked `config.jsonc`, ignored `config.local.jsonc` 순이며 뒤의 값이 앞의 값을 override한다. Project profile, balance threshold, execution limit과 cache policy는 tracked config에 둘 수 있다. Secret, provider credential과 machine-specific runtime path는 넣지 않는다.
 
-실행 중 변경되는 graph snapshot, session ID, branch와 recoverable commit은 `.quack/`에 쓰지 않고 Git metadata 아래 `.git/quackery/runs/`에 저장한다. Temporary child worktree는 OS temporary directory를 사용한다. 따라서 project policy와 ephemeral execution state가 섞이지 않고, child commit에 runtime state가 우연히 포함되지 않는다.
+실행 중 변경되는 graph snapshot, session ID, worktree, branch, recoverable commit, applied commit과 cleanup 결과는 `.quack/`에 쓰지 않고 Git metadata 아래 `.git/quackery/runs/`에 저장한다. Temporary child worktree는 OS temporary directory를 사용한다. 따라서 project policy와 ephemeral execution state가 섞이지 않고, child commit에 runtime state가 우연히 포함되지 않는다.
 
 ### 11.7 Parent-boundary prompt cache
 
@@ -839,7 +841,7 @@ kind: needs-nurse
 reason: "상태 전이와 persistence가 현재 scope에서 과도하게 결합됨"
 ```
 
-Runtime은 Surgeon의 미완성 working-tree 변경을 recoverable Git stash로 보존한 뒤 같은 node를 Nurse에게 다시 전달한다. Sibling subtree는 취소하거나 재실행하지 않는다. 재분해 횟수는 `limits.maxNeedsNurseBounces`로 제한하며, 상한을 다시 넘으면 해당 subtree만 실패한다. Integration LEAF의 `NEEDS_NURSE` 재분해는 별도 join-repair semantics가 필요하므로 초기 구현 범위 밖이다.
+Runtime은 Surgeon의 미완성 working-tree 변경을 recoverable Git stash로 보존한 뒤 같은 node를 Nurse에게 다시 전달한다. Sibling subtree는 취소하거나 재실행하지 않는다. 재분해 횟수는 `limits.maxNeedsNurseBounces`로 제한하며, 상한을 다시 넘으면 해당 subtree만 실패한다. Integration LEAF도 composed child commit에서 전용 worktree를 만든 일반 leaf이므로 같은 local Nurse 재분해 경로를 사용한다.
 
 ### Contract failure
 
@@ -868,9 +870,10 @@ Parent가 WIT world나 behavior contract를 수정하면 해당 revision에 의�
 - 최대 graph depth
 - 최대 node 수
 - Leaf별 `NEEDS_NURSE` 재분해 횟수
-- Node별 retry와 timeout
-- Model별 token 또는 비용 budget
-- 전체 run timeout
+- OpenCode request별 timeout
+- Verification command별 timeout
+- 전체 run timeout과 abort signal
+- Provider telemetry 기반 token 또는 비용 budget은 live 측정 뒤 도입
 
 상한에 도달하면 Quackery는 계속 생각하지 않고 미완료 graph와 실패 이유를 반환한다.
 
@@ -1051,7 +1054,7 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 19. Nurse는 child result commit을 local join하고, Pharmacist는 root join을 수행한다.
 20. Pharmacist root join과 root acceptance가 통과해야 실행이 완료된다.
 21. 성공 결과는 recoverable Git commit으로 남고 사용자 승인 후 invocation branch에 적용된다.
-22. 실행은 설정된 depth, node, retry, token과 time budget을 초과하지 않는다.
+22. 실행은 설정된 depth, node, `NEEDS_NURSE`, request, verification과 whole-run time limit을 초과하지 않으며 provider token/cost hard cap은 지원 여부를 측정하기 전까지 명시적으로 `UNKNOWN`이다.
 23. Intent와 graph 상태는 agent conversation context와 독립적으로 저장된다.
 24. 의미적 decomposition은 규칙 기반 deterministic compiler로 대체되지 않는다.
 25. Pharmacist와 Nurse의 SPLIT은 child별 estimated remaining depth와 work를 기록하고 설정된 balance limit을 만족하거나 불가피한 이유를 남긴다.
@@ -1064,6 +1067,11 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 32. Cache prefix에는 실행 중인 child의 node ID, session ID, worktree path, timestamp와 node-specific instructions가 포함되지 않는다.
 33. Text graph는 provider가 반환한 input/output/cache read/cache write/cost telemetry를 집계한다.
 34. Cache warm-up 때문에 Surgeon 또는 Nurse fan-out을 기다리게 하는 global barrier가 없다.
+35. 최종 root result commit에는 현재 run의 `.quack/contracts/<run>/` artifact가 포함되지 않는다.
+36. Process restart 뒤 persisted graph를 조회하고 verified result를 적용할 수 있으며 in-flight run은 자동 재호출 없이 `interrupted`로 표시한다.
+37. Apply 성공 뒤 temporary worktree와 run branch를 정리하고 cleanup failure를 별도로 보고·재시도한다.
+38. Integration LEAF의 `NEEDS_NURSE`는 completed sibling을 재실행하지 않고 integration subtree만 재귀 분해한다.
+39. Agent는 shell을 직접 실행하지 않으며 runtime verification이 worktree를 변경하면 result를 거부한다.
 
 ## 18. Design Invariants
 
@@ -1131,18 +1139,15 @@ Cache key는 같은 model이 같은 frozen boundary를 읽는 sibling cohort의 
 
 다음은 core가 아니라 구현 단계에서 결정할 사항이다.
 
-- Graph state storage format
-- Intent Contract storage와 revision format
 - Psychiatrist에서 Pharmacist로 넘길 confirmed intent 선택 UX
 - Direct Pharmacist request를 허용할 ambiguity threshold
 - Primary agent display order와 naming
-- Run branch와 temporary worktree naming/layout
 - Child result commit을 합성할 구체적인 Git primitive
 - OpenCode plugin API version별 host adapter
 - WIT parser와 validator 배포 방식
 - 우선 지원할 target-language WIT projection과 stub generator
 - WIT world와 repository symbol binding 방식
-- 기본 depth, node, retry와 token budget
+- 기본 token/cost budget과 provider-side hard-cap 지원
 - Provider별 explicit cache breakpoint 지원과 live cache-hit 검증
 
 어떤 선택을 하더라도 두 selectable primary agent, Pharmacist-internal parallel Nurses/Surgeons, Git-isolated recursive fan-out, WIT abstract-complete worlds, one-writer ownership, immediate Surgeon execution과 recursive join은 유지해야 한다.

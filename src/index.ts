@@ -7,12 +7,23 @@ import { configuredRoleModel, loadQuackConfig, type ModelRole, type QuackConfig,
 import { pharmacistPrompt, psychiatristPrompt, nursePrompt, surgeonPrompt } from "./prompts.js"
 import { RunRegistry } from "./registry.js"
 import { IntentRegistry } from "./intent.js"
+import { renderRunSnapshot } from "./graph.js"
+import { renderPreflight, runPreflight } from "./preflight.js"
 import { ownershipContains } from "./validation.js"
 
 function toolPaths(toolName: string, args: Record<string, unknown>): string[] {
   const direct = [args.filePath, args.path, args.filename].filter((value): value is string => typeof value === "string")
+  if (Array.isArray(args.edits)) {
+    for (const edit of args.edits) {
+      if (!edit || typeof edit !== "object") continue
+      const record = edit as Record<string, unknown>
+      const path = [record.filePath, record.path, record.filename]
+        .find((value): value is string => typeof value === "string")
+      if (path) direct.push(path)
+    }
+  }
   const patch = typeof args.patchText === "string" ? args.patchText : typeof args.patch === "string" ? args.patch : ""
-  if (toolName === "apply_patch" && patch) {
+  if ((toolName === "apply_patch" || toolName === "patch") && patch) {
     for (const match of patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)) {
       const path = match[1]?.trim()
       if (path) direct.push(path)
@@ -48,15 +59,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
         edit: "deny",
         task: "deny",
         "quackery_intent_confirm": "allow",
-        bash: {
-          "*": "deny",
-          "git status*": "allow",
-          "git log*": "allow",
-          "git diff*": "allow",
-          "git show*": "allow",
-          "rg *": "allow",
-          "ls *": "allow",
-        },
+        bash: "deny",
       },
     },
     pharmacist: {
@@ -77,7 +80,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
       prompt: nursePrompt,
       permission: {
         edit: "allow",
-        bash: "allow",
+        bash: "deny",
         task: "deny",
       },
     },
@@ -88,7 +91,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
       prompt: surgeonPrompt,
       permission: {
         edit: "allow",
-        bash: "allow",
+        bash: "deny",
         task: "deny",
       },
     },
@@ -190,7 +193,7 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
     },
 
     "tool.execute.before": async (input, output) => {
-      if (!["write", "edit", "apply_patch"].includes(input.tool)) return
+      if (!["write", "edit", "multiedit", "patch", "apply_patch"].includes(input.tool)) return
       const authorized = authorizedSessions.get(input.sessionID)
       if (!authorized) {
         if (pharmacistSessions.has(input.sessionID)) {
@@ -280,6 +283,11 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
               enabled: quack.cache.mode === "auto",
               minFanout: quack.cache.minFanout,
             },
+            timeouts: {
+              runMs: quack.limits.maxRunSeconds * 1_000,
+              promptMs: quack.limits.maxPromptSeconds * 1_000,
+              verificationMs: quack.limits.verificationSeconds * 1_000,
+            },
           })
           return {
             title: `Quackery ${handle.id}`,
@@ -293,11 +301,11 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
         description: "Render the current Quackery graph as ordinary text.",
         args: { runId: tool.schema.string().optional() },
         async execute(args, context) {
-          const handle = registry.resolve(args.runId, context.sessionID)
+          const snapshot = await registry.snapshot(context.directory, args.runId, context.sessionID)
           return {
-            title: `Quackery ${handle.id}`,
-            output: handle.graph.render(),
-            metadata: { runId: handle.id, status: handle.graph.snapshot.status },
+            title: `Quackery ${snapshot.id}`,
+            output: renderRunSnapshot(snapshot),
+            metadata: { runId: snapshot.id, status: snapshot.status },
           }
         },
       }),
@@ -314,6 +322,19 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
         },
       }),
 
+      quackery_doctor: tool({
+        description: "Check every local prerequisite without invoking a model provider.",
+        args: {},
+        async execute(_args, context) {
+          const report = await runPreflight(context.directory, quack, effectiveModels)
+          return {
+            title: report.ready ? "Quackery ready" : "Quackery preflight failed",
+            output: renderPreflight(report),
+            metadata: { ready: report.ready },
+          }
+        },
+      }),
+
       quackery_wait: tool({
         description: "Wait briefly for a Quackery run and then return its text graph.",
         args: {
@@ -321,15 +342,16 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
           timeoutSeconds: tool.schema.number().int().min(1).max(60).default(30),
         },
         async execute(args, context) {
-          const handle = registry.resolve(args.runId, context.sessionID)
-          await Promise.race([
-            handle.promise,
-            new Promise((resolveWait) => setTimeout(resolveWait, args.timeoutSeconds * 1_000)),
-          ])
+          const snapshot = await registry.wait(
+            context.directory,
+            args.runId,
+            context.sessionID,
+            args.timeoutSeconds,
+          )
           return {
-            title: `Quackery ${handle.id}`,
-            output: handle.graph.render(),
-            metadata: { runId: handle.id, status: handle.graph.snapshot.status },
+            title: `Quackery ${snapshot.id}`,
+            output: renderRunSnapshot(snapshot),
+            metadata: { runId: snapshot.id, status: snapshot.status },
           }
         },
       }),
@@ -338,17 +360,29 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
         description: "Apply a verified root result commit to the unchanged invocation branch after approval.",
         args: { runId: tool.schema.string().optional() },
         async execute(args, context) {
-          const handle = registry.resolve(args.runId, context.sessionID)
-          const result = await handle.promise
-          if (!result.ok) throw new Error(`Run failed: ${result.reason}`)
+          if (context.agent !== "pharmacist") throw new Error("Only Pharmacist can apply a Quackery result")
+          const snapshot = await registry.snapshot(context.directory, args.runId, context.sessionID)
+          if (snapshot.status === "applied") {
+            const recovered = await registry.apply(context.directory, snapshot.id, context.sessionID)
+            const cleanup = recovered.cleanup?.failures.length
+              ? ` Cleanup still needs attention: ${recovered.cleanup.failures.join("; ")}`
+              : " Cleanup is complete."
+            return `Run ${snapshot.id} was already applied at ${snapshot.appliedCommit}.${cleanup}`
+          }
+          if (snapshot.status !== "verified" || !snapshot.resultCommit) {
+            throw new Error(`Run ${snapshot.id} is ${snapshot.status}; only a verified result can be applied`)
+          }
           await context.ask({
             permission: "quackery_apply",
-            patterns: [result.headCommit],
+            patterns: [snapshot.resultCommit],
             always: [],
-            metadata: { runId: handle.id, commit: result.headCommit },
+            metadata: { runId: snapshot.id, commit: snapshot.resultCommit },
           })
-          await handle.git.applyResult(handle.invocationBase, result.headCommit)
-          return `Applied verified result ${result.headCommit} to the invocation branch.`
+          const applied = await registry.apply(context.directory, snapshot.id, context.sessionID)
+          const cleanup = applied.cleanup?.failures.length
+            ? ` Cleanup warning: ${applied.cleanup.failures.join("; ")}`
+            : " Temporary worktrees and run branches were cleaned."
+          return `Applied verified result ${snapshot.resultCommit} at ${applied.appliedCommit}.${cleanup}`
         },
       }),
     },

@@ -17,7 +17,7 @@ export const worldRefSchema = z.object({
 export type WorldRef = z.infer<typeof worldRefSchema>
 
 export const nodePlanSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, "must be one safe path segment"),
   kind: z.enum(["scope", "leaf"]),
   scope: z.string().min(1),
   exports: z.array(z.string().min(1)).length(1),
@@ -153,6 +153,7 @@ export interface GraphNodeState {
   boundaryCommit?: string
   headCommit?: string
   failure?: string
+  recoverableCommit?: string
   cacheGroup?: string
   usage?: TokenUsage
   startedAt?: number
@@ -161,11 +162,19 @@ export interface GraphNodeState {
 
 export interface RunSnapshot {
   id: string
+  sessionId?: string
   repository: string
   rootNodeId: string
   invocationBase: string
   resultCommit?: string
-  status: "running" | "verified" | "failed"
+  appliedCommit?: string
+  worktrees?: Array<{ nodeId: string; path: string; branch: string }>
+  cleanup?: {
+    removedWorktrees: string[]
+    removedBranches: string[]
+    failures: string[]
+  }
+  status: "running" | "verified" | "failed" | "interrupted" | "applied"
   nodes: GraphNodeState[]
   createdAt: number
   updatedAt: number

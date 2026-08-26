@@ -199,7 +199,10 @@ test("turns only a NEEDS_NURSE leaf back into recursive decomposition", async ()
       }
       return success(node, `${node.id}-result`)
     },
-    async prepareNeedsNurse(node) { events.push(`preserve:${node.id}`) },
+    async prepareNeedsNurse(node) {
+      events.push(`preserve:${node.id}`)
+      return `stash-${node.id}`
+    },
     async join(node, _boundary, children) {
       return success(node, `${node.id}-joined`, 1 + Math.max(...children.map((child) => child.actualDepth)))
     },
@@ -213,6 +216,70 @@ test("turns only a NEEDS_NURSE leaf back into recursive decomposition", async ()
   expect(attempts.get("root/a/a1")).toBe(1)
   expect(attempts.get("root/a/a2")).toBe(1)
   expect(graph.render()).toContain("nurse · a · verified")
+  expect(graph.snapshot.nodes.find((node) => node.id === "root/a")?.recoverableCommit).toBe("stash-root/a")
+})
+
+test("turns an integration LEAF back into a local Nurse subtree", async () => {
+  const root = rootContext()
+  const attempts = new Map<string, number>()
+  const events: string[] = []
+  const rootDecision: SplitDecision = {
+    kind: "split",
+    children: [
+      plan("a", "leaf", "a", [], 0, "src/a"),
+      plan("b", "leaf", "b", [], 0, "src/b"),
+    ],
+    join: {
+      integration: plan("root-join", "leaf", "feature", ["a", "b"], 0, "src/integration"),
+      verify: [],
+    },
+  }
+  const repairDecision: SplitDecision = {
+    kind: "split",
+    children: [
+      plan("wire-a", "leaf", "wire-a", ["a", "b"], 0, "src/integration/a"),
+      plan("wire-b", "leaf", "wire-b", ["a", "b"], 0, "src/integration/b"),
+    ],
+    join: {
+      integration: plan("wire-join", "leaf", "feature", ["wire-a", "wire-b"], 0, "src/integration/index.ts"),
+      verify: [],
+    },
+  }
+  const adapter: ExecutionAdapter = {
+    async decompose(node) {
+      events.push(`decompose:${node.id}`)
+      return node.id === "root" ? rootDecision : repairDecision
+    },
+    async commitBoundary(node) { return `${node.id}-boundary` },
+    async forkChild(parent, boundaryCommit, childPlan) {
+      return childContext(parent, boundaryCommit, childPlan)
+    },
+    async prepareJoin(node) {
+      events.push(`compose:${node.id}`)
+      return `${node.id}-composed`
+    },
+    async runLeaf(node) {
+      const count = (attempts.get(node.id) ?? 0) + 1
+      attempts.set(node.id, count)
+      events.push(`leaf:${node.id}:${count}`)
+      if (node.id === "root/integration" && count === 1) {
+        return { ok: false, nodeId: node.id, reason: "NEEDS_NURSE", actualDepth: 0 }
+      }
+      return success(node, `${node.id}-result`)
+    },
+    async prepareNeedsNurse(node) { events.push(`preserve:${node.id}`) },
+    async join(node) { return success(node, `${node.id}-joined`) },
+  }
+  const graph = new RunGraph({ id: "integration-bounce", repository: "/fake", root, invocationBase: "base" })
+  const result = await new RecursiveRuntime(graph, adapter, runtimePolicy()).execute(root)
+  expect(result.ok).toBe(true)
+  expect(events).toContain("preserve:root/integration")
+  expect(events).toContain("decompose:root/integration")
+  expect(attempts.get("root/a")).toBe(1)
+  expect(attempts.get("root/b")).toBe(1)
+  expect(attempts.get("root/integration/wire-a")).toBe(1)
+  expect(attempts.get("root/integration/wire-b")).toBe(1)
+  expect(graph.render()).toContain("nurse · root-join · verified")
 })
 
 function rootContext(): NodeContext {

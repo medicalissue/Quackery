@@ -29,8 +29,15 @@ export interface ExecutionAdapter {
   commitBoundary(node: NodeContext, decision: DecompositionDecision): Promise<string>
   forkChild(parent: NodeContext, boundaryCommit: string, plan: NodePlan): Promise<NodeContext>
   runLeaf(node: NodeContext, boundaryCommit: string): Promise<NodeResult>
-  prepareNeedsNurse(node: NodeContext): Promise<void>
-  join(node: NodeContext, boundaryCommit: string, children: NodeSuccess[], decision: SplitDecision): Promise<NodeResult>
+  prepareNeedsNurse(node: NodeContext): Promise<void | string>
+  prepareJoin?(node: NodeContext, children: NodeSuccess[]): Promise<string>
+  join(
+    node: NodeContext,
+    boundaryCommit: string,
+    children: NodeSuccess[],
+    decision: SplitDecision,
+    integration?: NodeSuccess,
+  ): Promise<NodeResult>
 }
 
 export class RecursiveRuntime {
@@ -129,21 +136,35 @@ export class RecursiveRuntime {
     }
 
     this.graph.transition(node.id, "joining")
+    let joinBase: string
+    try {
+      joinBase = this.adapter.prepareJoin
+        ? await this.adapter.prepareJoin(node, childResults.filter((result): result is NodeSuccess => result.ok))
+        : boundaryCommit
+    } catch (error) {
+      return this.failed(node, "Child result composition failed", error)
+    }
     const integrationPlan = decision.join.integration
-    const integrationNode = integrationPlan ? {
-      id: `${node.id}/integration`,
-      parentId: node.id,
-      depth: node.depth + 1,
-      role: "integration-surgeon" as const,
-      scope: integrationPlan.scope,
-      plan: integrationPlan,
-      worktree: node.worktree,
-      baseCommit: boundaryCommit,
-      boundaryRoot: node.boundaryRoot,
-    } : undefined
-    if (integrationNode) {
+    let integrationResult: NodeSuccess | undefined
+    let integrationNode: NodeContext | undefined
+    if (integrationPlan) {
+      if (this.nodeCount >= this.policy.maxNodes) {
+        return this.failed(node, `Maximum node count ${this.policy.maxNodes} exceeded before integration`)
+      }
+      this.nodeCount += 1
+      try {
+        integrationNode = await this.adapter.forkChild(node, joinBase, { ...integrationPlan, id: "integration" })
+      } catch (error) {
+        return this.failed(node, "Integration worktree creation failed", error)
+      }
+      integrationNode.role = "integration-surgeon"
+      delete integrationNode.cache
       this.graph.add(integrationNode)
-      this.graph.transition(integrationNode.id, "implementing")
+      const result = await this.executeNode(integrationNode)
+      if (!result.ok) {
+        return this.failed(node, `Integration ${integrationNode.id} failed: ${result.reason}`)
+      }
+      integrationResult = result
     }
     try {
       const result = await this.adapter.join(
@@ -151,22 +172,17 @@ export class RecursiveRuntime {
         boundaryCommit,
         childResults.filter((result): result is NodeSuccess => result.ok),
         decision,
+        integrationResult,
       )
-      const actualDepth = 1 + Math.max(0, ...childResults.map((result) => result.actualDepth))
+      const actualDepth = 1 + Math.max(
+        0,
+        ...childResults.map((result) => result.actualDepth),
+        integrationResult?.actualDepth ?? 0,
+      )
       result.actualDepth = actualDepth
-      if (integrationNode) {
-        this.graph.transition(integrationNode.id, result.ok ? "verified" : "failed", {
-          ...(result.ok ? { headCommit: result.headCommit } : { failure: result.reason }),
-        })
-      }
       this.recordResult(node, result)
       return result
     } catch (error) {
-      if (integrationNode) {
-        this.graph.transition(integrationNode.id, "failed", {
-          failure: error instanceof Error ? error.message : String(error),
-        })
-      }
       return this.failed(node, "Recursive join failed", error)
     }
   }
@@ -189,7 +205,10 @@ export class RecursiveRuntime {
       const bounces = this.needsNurseBounces.get(node.id) ?? 0
       if (bounces < this.policy.maxNeedsNurseBounces) {
         try {
-          await this.adapter.prepareNeedsNurse(node)
+          const recoverableCommit = await this.adapter.prepareNeedsNurse(node)
+          if (recoverableCommit) {
+            this.graph.transition(node.id, "implementing", { recoverableCommit })
+          }
         } catch (error) {
           return this.failed(node, "Failed to preserve Surgeon attempt before Nurse bounce", error)
         }
@@ -204,6 +223,11 @@ export class RecursiveRuntime {
   }
 
   private validateSplit(node: NodeContext, decision: SplitDecision): void {
+    const childIds = decision.children.map((child) => child.id)
+    if (new Set(childIds).size !== childIds.length) throw new Error("Split child IDs must be unique")
+    if (decision.join.integration && childIds.includes(decision.join.integration.id)) {
+      throw new Error("Integration ID must not collide with a child ID")
+    }
     assertBalancedSplit(decision, this.policy)
     assertDisjointOwnership(decision.children, decision.join.integration?.owns ?? [])
     assertWorldWiring(node.plan, decision.children)
@@ -255,6 +279,7 @@ export class RecursiveRuntime {
     } else {
       this.graph.transition(node.id, "failed", {
         failure: result.reason,
+        ...(result.recoverableCommit ? { recoverableCommit: result.recoverableCommit } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
       })
     }
