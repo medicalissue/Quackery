@@ -221,9 +221,15 @@ export class RecursiveRuntime {
 
   private recordResult(node: NodeContext, result: NodeResult): void {
     if (result.ok) {
-      this.graph.transition(node.id, "verified", { headCommit: result.headCommit })
+      this.graph.transition(node.id, "verified", {
+        headCommit: result.headCommit,
+        ...(result.usage ? { usage: result.usage } : {}),
+      })
     } else {
-      this.graph.transition(node.id, "failed", { failure: result.reason })
+      this.graph.transition(node.id, "failed", {
+        failure: result.reason,
+        ...(result.usage ? { usage: result.usage } : {}),
+      })
     }
   }
 

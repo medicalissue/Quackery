@@ -69,6 +69,21 @@ export type DecompositionDecision = z.infer<typeof decompositionDecisionSchema>
 
 export type NodeRole = "pharmacist" | "nurse" | "surgeon" | "integration-surgeon"
 
+export interface CacheContext {
+  protocol: string
+  group: string
+  prefix: string
+}
+
+export interface TokenUsage {
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+}
+
 export interface NodeContext {
   id: string
   parentId?: string
@@ -79,6 +94,7 @@ export interface NodeContext {
   worktree: string
   baseCommit: string
   boundaryCommit?: string
+  cache?: CacheContext
 }
 
 export type NodeStatus =
@@ -105,6 +121,7 @@ export interface NodeSuccess {
   changedPaths: string[]
   evidence: VerificationEvidence[]
   actualDepth: number
+  usage?: TokenUsage
 }
 
 export interface NodeFailure {
@@ -114,6 +131,7 @@ export interface NodeFailure {
   detail?: string
   recoverableCommit?: string
   actualDepth: number
+  usage?: TokenUsage
 }
 
 export type NodeResult = NodeSuccess | NodeFailure
@@ -131,6 +149,8 @@ export interface GraphNodeState {
   boundaryCommit?: string
   headCommit?: string
   failure?: string
+  cacheGroup?: string
+  usage?: TokenUsage
   startedAt?: number
   completedAt?: number
 }

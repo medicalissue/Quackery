@@ -38,6 +38,7 @@ export class RunGraph {
         estimatedRemainingDepth: context.plan.estimatedRemainingDepth,
         estimatedWork: context.plan.estimatedWork,
       } : {}),
+      ...(context.cache ? { cacheGroup: context.cache.group } : {}),
     }
     this.snapshot.nodes.push(state)
     this.changed()
@@ -80,7 +81,12 @@ export class RunGraph {
       const connector = last ? "└─" : "├─"
       const commit = node.headCommit ? ` · ${node.headCommit.slice(0, 7)}` : ""
       const failure = node.failure ? ` · ${node.failure}` : ""
-      lines.push(`${prefix}${connector} ${node.role} · ${node.scope} · ${node.status}${commit}${failure}`)
+      const cache = node.cacheGroup
+        ? node.usage
+          ? ` · cache ${node.usage.cacheRead}r/${node.usage.cacheWrite}w`
+          : " · cache eligible"
+        : ""
+      lines.push(`${prefix}${connector} ${node.role} · ${node.scope} · ${node.status}${commit}${cache}${failure}`)
       const nested = children.get(node.id) ?? []
       nested.forEach((child, index) => renderNode(child, `${prefix}${last ? "   " : "│  "}`, index === nested.length - 1))
     }
@@ -89,6 +95,21 @@ export class RunGraph {
     const counts = new Map<NodeStatus, number>()
     for (const node of this.snapshot.nodes) counts.set(node.status, (counts.get(node.status) ?? 0) + 1)
     lines.push("", [...counts.entries()].map(([status, count]) => `${count} ${status}`).join(" · "))
+    const usage = this.snapshot.nodes.reduce(
+      (total, node) => ({
+        input: total.input + (node.usage?.input ?? 0),
+        output: total.output + (node.usage?.output ?? 0),
+        cacheRead: total.cacheRead + (node.usage?.cacheRead ?? 0),
+        cacheWrite: total.cacheWrite + (node.usage?.cacheWrite ?? 0),
+        cost: total.cost + (node.usage?.cost ?? 0),
+      }),
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    )
+    if (usage.input || usage.output || usage.cacheRead || usage.cacheWrite || usage.cost) {
+      lines.push(
+        `tokens ${usage.input} in · ${usage.output} out · cache ${usage.cacheRead} read/${usage.cacheWrite} write · cost $${usage.cost.toFixed(4)}`,
+      )
+    }
     return lines.join("\n")
   }
 

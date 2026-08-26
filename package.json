@@ -8,7 +8,9 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    ".quack/config.jsonc",
+    ".quack/config.local.example.jsonc"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -20,6 +22,7 @@
     "@bytecodealliance/jco": "1.32.1",
     "@opencode-ai/plugin": "1.18.23",
     "@opencode-ai/sdk": "1.18.23",
+    "jsonc-parser": "3.3.1",
     "zod": "^4.1.5"
   },
   "devDependencies": {

@@ -2,6 +2,7 @@ import { access } from "node:fs/promises"
 import { z } from "zod"
 import type { DecompositionDecision, NodeContext, NodePlan, NodeResult, NodeSuccess, SplitDecision } from "./model.js"
 import { decompositionDecisionSchema } from "./model.js"
+import { addUsage, boundaryCacheSeed, cacheContext, emptyUsage, usageFromResponse, type BoundaryCacheSeed } from "./cache.js"
 import type { ExecutionAdapter } from "./runtime.js"
 import { GitWorkspaceManager } from "./git.js"
 import { assertNodeWorldMatchesWit, resolveRepositoryPath } from "./validation.js"
@@ -51,10 +52,16 @@ export interface OpenCodeAdapterOptions {
   git: GitWorkspaceManager
   parentSessionId: string
   authorizeSession(sessionId: string, node: NodeContext): void
+  cache: {
+    enabled: boolean
+    minFanout: number
+  }
 }
 
 export class OpenCodeExecutionAdapter implements ExecutionAdapter {
   private readonly decompositionSessions = new Map<string, string>()
+  private readonly boundaries = new Map<string, { seed: BoundaryCacheSeed; cacheRoles: Set<"nurse" | "surgeon"> }>()
+  private readonly usage = new Map<string, ReturnType<typeof emptyUsage>>()
 
   constructor(private readonly options: OpenCodeAdapterOptions) {}
 
@@ -62,7 +69,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     const agent = node.depth === 0 ? "pharmacist" : "nurse"
     const sessionId = await this.createSession(node, agent, `${agent} · ${node.scope}`)
     this.decompositionSessions.set(node.id, sessionId)
-    const response = await this.prompt(sessionId, node.worktree, agent, decompositionPrompt(node))
+    const response = await this.prompt(node, sessionId, agent, decompositionPrompt(node))
     return decompositionDecisionSchema.parse(parseJsonResponse(response))
   }
 
@@ -78,21 +85,37 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     }
     const commit = await this.options.git.commitAll(node.id, `quackery(${node.id}): freeze abstract worlds`)
     if (node.plan) await this.options.git.assertOwned(node.id, node.baseCommit, node.plan.owns, commit)
+    const seed = boundaryCacheSeed(node, commit, decision)
+    const cacheRoles = new Set<"nurse" | "surgeon">()
+    if (this.options.cache.enabled && decision.kind === "split") {
+      const nurseCount = decision.children.filter((plan) => plan.kind === "scope").length
+      const surgeonCount = decision.children.filter((plan) => plan.kind === "leaf").length
+      if (nurseCount >= this.options.cache.minFanout) cacheRoles.add("nurse")
+      if (surgeonCount >= this.options.cache.minFanout) cacheRoles.add("surgeon")
+    }
+    this.boundaries.set(node.id, { seed, cacheRoles })
+    // A locally decomposed leaf changes role from Nurse to Surgeon and must not
+    // reuse the Nurse cohort's cache partition.
+    if (decision.kind === "leaf") delete node.cache
     return commit
   }
 
   async forkChild(parent: NodeContext, boundaryCommit: string, plan: NodePlan): Promise<NodeContext> {
     const id = `${parent.id}/${plan.id}`
     const record = await this.options.git.create(id, boundaryCommit)
+    const role = plan.kind === "leaf" ? "surgeon" : "nurse"
+    const boundary = this.boundaries.get(parent.id)
+    const cache = boundary?.cacheRoles.has(role) ? cacheContext(boundary.seed, role) : undefined
     return {
       id,
       parentId: parent.id,
       depth: parent.depth + 1,
-      role: plan.kind === "leaf" ? "surgeon" : "nurse",
+      role,
       scope: plan.scope,
       plan,
       worktree: record.path,
       baseCommit: boundaryCommit,
+      ...(cache ? { cache } : {}),
     }
   }
 
@@ -102,7 +125,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     await access(resolveRepositoryPath(node.worktree, node.plan.world.behaviorPath))
 
     const sessionId = await this.createSession(node, "surgeon", `surgeon · ${node.scope}`)
-    const response = await this.prompt(sessionId, node.worktree, "surgeon", implementationPrompt(node))
+    const response = await this.prompt(node, sessionId, "surgeon", implementationPrompt(node))
     const agentResult = implementationResponseSchema.parse(parseJsonResponse(response))
     if (agentResult.kind !== "implemented") {
       return {
@@ -111,6 +134,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         reason: agentResult.kind === "needs-nurse" ? "NEEDS_NURSE" : "CONTRACT_FAILURE",
         detail: agentResult.reason,
         actualDepth: 0,
+        usage: this.nodeUsage(node.id),
       }
     }
 
@@ -132,6 +156,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: error instanceof Error ? error.message : String(error),
         recoverableCommit: committedHead,
         actualDepth: 0,
+        usage: this.nodeUsage(node.id),
       }
     }
     const failedEvidence = evidence.find((item) => item.exitCode !== 0)
@@ -143,6 +168,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: `${failedEvidence.command} exited with ${failedEvidence.exitCode}`,
         recoverableCommit: committedHead,
         actualDepth: 0,
+        usage: this.nodeUsage(node.id),
       }
     }
     return {
@@ -153,6 +179,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       changedPaths,
       evidence,
       actualDepth: 0,
+      usage: this.nodeUsage(node.id),
     }
   }
 
@@ -179,11 +206,12 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       }
       const sessionId = await this.createSession(integrationContext, "surgeon", `integration surgeon · ${node.scope}`)
       const response = await this.prompt(
+        integrationContext,
         sessionId,
-        node.worktree,
         "surgeon",
         integrationPrompt(node, decision, children.map((child) => child.headCommit)),
       )
+      this.usage.set(node.id, addUsage(this.nodeUsage(node.id), this.nodeUsage(integrationContext.id)))
       const agentResult = implementationResponseSchema.parse(parseJsonResponse(response))
       if (agentResult.kind !== "implemented") {
         return {
@@ -192,6 +220,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
           reason: agentResult.kind === "needs-nurse" ? "INTEGRATION_NEEDS_NURSE" : "INTEGRATION_CONTRACT_FAILURE",
           detail: agentResult.reason,
           actualDepth: 0,
+          usage: this.nodeUsage(node.id),
         }
       }
     }
@@ -212,6 +241,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
           detail: error instanceof Error ? error.message : String(error),
           recoverableCommit: committedHead,
           actualDepth: 0,
+          usage: this.nodeUsage(node.id),
         }
       }
     } else {
@@ -224,6 +254,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
           detail: `Verification changed tracked paths: ${verificationMutations.join(", ")}`,
           recoverableCommit: committedHead,
           actualDepth: 0,
+          usage: this.nodeUsage(node.id),
         }
       }
     }
@@ -236,6 +267,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: `${failedEvidence.command} exited with ${failedEvidence.exitCode}`,
         recoverableCommit: committedHead,
         actualDepth: 0,
+        usage: this.nodeUsage(node.id),
       }
     }
     const normalized = await this.options.git.normalizedResultCommit(
@@ -252,6 +284,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       changedPaths,
       evidence: [...children.flatMap((child) => child.evidence), ...evidence],
       actualDepth: 0,
+      usage: this.nodeUsage(node.id),
     }
   }
 
@@ -275,14 +308,20 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     return sessionId
   }
 
-  private prompt(sessionId: string, directory: string, agent: string, text: string): Promise<unknown> {
-    return this.options.client.session.prompt({
+  private async prompt(node: NodeContext, sessionId: string, agent: string, text: string): Promise<unknown> {
+    const response = await this.options.client.session.prompt({
       path: { id: sessionId },
-      query: { directory },
+      query: { directory: node.worktree },
       body: {
         agent,
         parts: [{ type: "text", text }],
       },
     })
+    this.usage.set(node.id, addUsage(this.nodeUsage(node.id), usageFromResponse(response)))
+    return response
+  }
+
+  private nodeUsage(nodeId: string): ReturnType<typeof emptyUsage> {
+    return this.usage.get(nodeId) ?? emptyUsage()
   }
 }

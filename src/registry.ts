@@ -25,6 +25,10 @@ export interface StartRunInput {
   client: Client
   authorizeSession(sessionId: string, node: NodeContext): void
   policy?: Partial<RuntimePolicy>
+  cache?: {
+    enabled: boolean
+    minFanout: number
+  }
 }
 
 const defaultPolicy: RuntimePolicy = {
@@ -63,6 +67,7 @@ export class RunRegistry {
       git: manager,
       parentSessionId: input.sessionId,
       authorizeSession: input.authorizeSession,
+      cache: input.cache ?? { enabled: true, minFanout: 2 },
     })
     const runtime = new RecursiveRuntime(graph, adapter, { ...defaultPolicy, ...input.policy })
     const stateDirectory = await this.stateDirectory(repository)

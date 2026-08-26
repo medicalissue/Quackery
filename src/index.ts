@@ -2,6 +2,8 @@ import { relative, resolve } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import type { NodeContext } from "./model.js"
+import { cachePartitionKey } from "./cache.js"
+import { configuredRoleModel, loadQuackConfig, type ModelRole, type QuackConfig, type ResolvedRoleModel } from "./config.js"
 import { pharmacistPrompt, psychiatristPrompt, nursePrompt, surgeonPrompt } from "./prompts.js"
 import { RunRegistry } from "./registry.js"
 import { ownershipContains } from "./validation.js"
@@ -23,76 +25,154 @@ function repositoryRelativePath(node: NodeContext, value: string): string {
   return relative(node.worktree, absolute).replaceAll("\\", "/")
 }
 
-function agentConfiguration(config: any): void {
+const modelRoles: ModelRole[] = ["psychiatrist", "pharmacist", "nurse", "surgeon"]
+
+function preservedAgentTuning(agent: any): Record<string, unknown> {
+  if (!agent || typeof agent !== "object") return {}
+  return Object.fromEntries(
+    ["model", "variant", "temperature", "top_p", "options", "steps", "maxSteps", "color"]
+      .filter((key) => agent[key] !== undefined)
+      .map((key) => [key, agent[key]]),
+  )
+}
+
+export function agentConfiguration(config: any, quack: QuackConfig): Record<ModelRole, ResolvedRoleModel> {
   config.agent ??= {}
-  config.agent.psychiatrist = {
-    description: "Clarifies user intent and produces a confirmed Intent Contract without implementation",
-    mode: "primary",
-    prompt: psychiatristPrompt,
-    permission: {
-      edit: "deny",
-      task: "deny",
-      bash: {
-        "*": "deny",
-        "git status*": "allow",
-        "git log*": "allow",
-        "git diff*": "allow",
-        "git show*": "allow",
-        "rg *": "allow",
-        "ls *": "allow",
+  const base: Record<ModelRole, Record<string, unknown>> = {
+    psychiatrist: {
+      description: "Clarifies user intent and produces a confirmed Intent Contract without implementation",
+      mode: "primary",
+      prompt: psychiatristPrompt,
+      permission: {
+        edit: "deny",
+        task: "deny",
+        bash: {
+          "*": "deny",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git diff*": "allow",
+          "git show*": "allow",
+          "rg *": "allow",
+          "ls *": "allow",
+        },
+      },
+    },
+    pharmacist: {
+      description: "Starts and reports Quackery's Git-native recursive parallel implementation runtime",
+      mode: "primary",
+      prompt: pharmacistPrompt,
+      permission: {
+        edit: "deny",
+        bash: "deny",
+        task: "deny",
+        "quackery_*": "allow",
+      },
+    },
+    nurse: {
+      description: "Internal recursive decomposer that creates balanced immediate WIT worlds",
+      mode: "subagent",
+      hidden: true,
+      prompt: nursePrompt,
+      permission: {
+        edit: "allow",
+        bash: "allow",
+        task: "deny",
+      },
+    },
+    surgeon: {
+      description: "Internal cheap implementer that fills one WIT export hole",
+      mode: "subagent",
+      hidden: true,
+      prompt: surgeonPrompt,
+      permission: {
+        edit: "allow",
+        bash: "allow",
+        task: "deny",
       },
     },
   }
-  config.agent.pharmacist = {
-    description: "Starts and reports Quackery's Git-native recursive parallel implementation runtime",
-    mode: "primary",
-    prompt: pharmacistPrompt,
-    permission: {
-      edit: "deny",
-      bash: "deny",
-      task: "deny",
-      "quackery_*": "allow",
-    },
+
+  const effective = {} as Record<ModelRole, ResolvedRoleModel>
+  for (const role of modelRoles) {
+    const existing = config.agent[role] ?? {}
+    const routed = configuredRoleModel(quack, role)
+    const tuning = preservedAgentTuning(existing)
+    const target = routed.model
+      ? { model: routed.model, ...(routed.variant ? { variant: routed.variant } : {}) }
+      : tuning
+    config.agent[role] = { ...base[role], ...tuning, ...target }
+    if (routed.model && !routed.variant) delete config.agent[role].variant
+    effective[role] = routed.model
+      ? routed
+      : {
+          ...routed,
+          ...(typeof existing.model === "string"
+            ? {
+                model: existing.model,
+                ...(typeof existing.variant === "string" ? { variant: existing.variant } : {}),
+                source: "opencode" as const,
+              }
+            : typeof config.model === "string"
+              ? { model: config.model, source: "inherit" as const }
+              : {}),
+        }
   }
-  config.agent.nurse = {
-    description: "Internal recursive decomposer that creates balanced immediate WIT worlds",
-    mode: "subagent",
-    hidden: true,
-    prompt: nursePrompt,
-    permission: {
-      edit: "allow",
-      bash: "allow",
-      task: "deny",
-    },
-  }
-  config.agent.surgeon = {
-    description: "Internal cheap implementer that fills one WIT export hole",
-    mode: "subagent",
-    hidden: true,
-    prompt: surgeonPrompt,
-    permission: {
-      edit: "allow",
-      bash: "allow",
-      task: "deny",
-    },
-  }
+  return effective
 }
 
-export const QuackeryPlugin: Plugin = async ({ client }) => {
+function renderModelRouting(config: QuackConfig, routing: Record<ModelRole, ResolvedRoleModel>): string {
+  const lines = [`profile ${config.profile}`, ""]
+  for (const role of modelRoles) {
+    const item = routing[role]
+    const model = item.model ?? "OpenCode current model"
+    const variant = item.variant ? ` #${item.variant}` : ""
+    lines.push(`${role.padEnd(12)} ${item.tier.padEnd(9)} ${model}${variant} · ${item.source}`)
+  }
+  return lines.join("\n")
+}
+
+export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => {
+  const quack = await loadQuackConfig(directory, options)
   const registry = new RunRegistry()
   const authorizedSessions = new Map<string, NodeContext>()
+  let effectiveModels = Object.fromEntries(
+    modelRoles.map((role) => [role, configuredRoleModel(quack, role)]),
+  ) as Record<ModelRole, ResolvedRoleModel>
 
   const authorizeSession = (sessionId: string, node: NodeContext): void => {
     authorizedSessions.set(sessionId, node)
   }
 
   return {
-    config: async (config) => agentConfiguration(config),
+    config: async (config) => {
+      effectiveModels = agentConfiguration(config, quack)
+    },
 
     "chat.message": async (input) => {
       if ((input.agent === "nurse" || input.agent === "surgeon") && !authorizedSessions.has(input.sessionID)) {
         throw new Error(`${input.agent} is internal to the Quackery runtime and cannot be invoked directly`)
       }
+    },
+
+    "chat.params": async (input, output) => {
+      const node = authorizedSessions.get(input.sessionID)
+      if (!node?.cache || quack.cache.mode === "off") return
+      if (input.model.providerID === "openai" || input.provider.options.setCacheKey === true) {
+        const role = node.role === "integration-surgeon" ? "surgeon" : node.role
+        const variant = role === "nurse" || role === "surgeon" ? effectiveModels[role].variant : undefined
+        output.options.promptCacheKey = cachePartitionKey(
+          node.cache,
+          input.model.providerID,
+          input.model.id,
+          variant,
+        )
+      }
+    },
+
+    "experimental.chat.system.transform": async (input, output) => {
+      if (!input.sessionID || quack.cache.mode === "off") return
+      const node = authorizedSessions.get(input.sessionID)
+      if (node?.cache) output.system.push(node.cache.prefix)
     },
 
     "tool.execute.before": async (input, output) => {
@@ -125,8 +205,13 @@ export const QuackeryPlugin: Plugin = async ({ client }) => {
             client,
             authorizeSession,
             policy: {
-              ...(args.maxDepth ? { maxDepth: args.maxDepth } : {}),
-              ...(args.maxNodes ? { maxNodes: args.maxNodes } : {}),
+              ...quack.balance,
+              maxDepth: args.maxDepth ?? quack.limits.maxDepth,
+              maxNodes: args.maxNodes ?? quack.limits.maxNodes,
+            },
+            cache: {
+              enabled: quack.cache.mode === "auto",
+              minFanout: quack.cache.minFanout,
             },
           })
           return {
@@ -146,6 +231,18 @@ export const QuackeryPlugin: Plugin = async ({ client }) => {
             title: `Quackery ${handle.id}`,
             output: handle.graph.render(),
             metadata: { runId: handle.id, status: handle.graph.snapshot.status },
+          }
+        },
+      }),
+
+      quackery_model_status: tool({
+        description: "Show the resolved Quackery role-to-model ladder and configuration source.",
+        args: {},
+        async execute() {
+          return {
+            title: "Quackery model routing",
+            output: renderModelRouting(quack, effectiveModels),
+            metadata: { profile: quack.profile },
           }
         },
       }),

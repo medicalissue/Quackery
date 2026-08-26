@@ -1,6 +1,6 @@
 # Quackery Specification
 
-**Status:** Draft 0.6
+**Status:** Draft 0.7
 
 **Category:** Git-native recursive parallel implementation plugin for OpenCode
 
@@ -76,6 +76,8 @@ Quackery는 다음을 목표로 한다.
 12. 인터뷰, 최상위 분해, 재귀 분해와 구현의 책임을 서로 다른 agent role로 분리한다.
 13. 각 Surgeon에게 하나의 export와 이미 완성됐다고 가정할 imports로 이루어진 abstract-complete world를 제공한다.
 14. 각 split의 sibling subtree가 비슷한 예상 remaining depth와 critical-path work를 갖도록 균형 있게 분해한다.
+15. 역할별 model quality ladder를 project-local policy로 설정하고 provider별 model ID는 local override로 분리한다.
+16. 병렬 fan-out의 동일 역할 sibling이 stable parent-boundary prompt prefix를 공유해 provider prompt cache를 재사용할 수 있게 한다.
 
 ## 4. Non-goals
 
@@ -649,6 +651,19 @@ Surgeon은 다음을 수행해서는 안 된다.
 
 Psychiatrist와 Pharmacist에는 높은 의도 해석 및 구조화 능력을 가진 모델을 사용한다. Nurse는 국소 분해에 충분한 중간 모델, Surgeon은 낮은 비용과 빠른 구현 모델을 기본으로 한다. 실제 routing은 역할 이름이 아니라 benchmark profile로 설정한다.
 
+### 10.1 Model quality ladder
+
+Quackery는 provider model 이름을 역할 prompt에 직접 박지 않는다. `.quack`의 네 단계 quality ladder가 실제 model과 variant를 가리키고, profile이 역할을 tier에 배치한다.
+
+| Profile | Psychiatrist | Pharmacist | Nurse | Surgeon |
+|---|---|---|---|---|
+| `quality` | frontier | frontier | strong | balanced |
+| `balanced` | frontier | strong | balanced | economy |
+
+`quality`는 분해 품질을 우선하고 `balanced`는 구현 fan-out 비용을 더 낮춘다. 어느 profile에서도 Psychiatrist는 frontier에 고정한다. 같은 역할의 sibling cohort는 cache 재사용을 위해 동일 model과 variant를 사용한다. 실패한 leaf를 승격하더라도 sibling 전체가 아니라 해당 leaf만 승격하며, 승격된 호출은 별도 cache partition으로 취급한다.
+
+Project는 tier와 role 정책만 공유하고 실제 provider/model ID는 개인별 `.quack/config.local.jsonc`에서 설정할 수 있다. Tier가 mapping되지 않았으면 Quackery는 OpenCode의 기존 role model 또는 현재 model을 그대로 상속한다. 즉 provider 선택권을 빼앗지 않으면서 역할별 비용 구조만 명시한다.
+
 ## 11. Git Isolation and Ownership
 
 Git은 결과 저장 수단이 아니라 Quackery의 isolation, provenance, rollback과 recursive join substrate다. Node의 입력은 commit이고 출력도 commit이다.
@@ -722,6 +737,36 @@ Shell, formatter, code generator 또는 test command가 소유하지 않은 trac
 ### 11.5 Recovery and cleanup
 
 Quackery는 user branch에 force push, hard reset 또는 implicit stash를 수행하지 않는다. 실패한 subtree의 branch와 last commit은 run metadata에 기록한다. 성공한 join과 사용자가 적용한 result만 확인한 뒤 임시 worktree를 정리한다. Cleanup 실패는 구현 성공과 구분해 보고하며 recoverable branch를 먼저 보존한다.
+
+### 11.6 `.quack` project policy and runtime state
+
+Repository-local Quackery configuration은 `.quack/`에 둔다.
+
+```text
+.quack/
+├─ config.jsonc                tracked project policy
+├─ config.local.jsonc          ignored provider/model override
+└─ config.local.example.jsonc  tracked setup example
+```
+
+설정 우선순위는 plugin options, tracked `config.jsonc`, ignored `config.local.jsonc` 순이며 뒤의 값이 앞의 값을 override한다. Project profile, balance threshold, execution limit과 cache policy는 tracked config에 둘 수 있다. Secret, provider credential과 machine-specific runtime path는 넣지 않는다.
+
+실행 중 변경되는 graph snapshot, session ID, branch와 recoverable commit은 `.quack/`에 쓰지 않고 Git metadata 아래 `.git/quackery/runs/`에 저장한다. Temporary child worktree는 OS temporary directory를 사용한다. 따라서 project policy와 ephemeral execution state가 섞이지 않고, child commit에 runtime state가 우연히 포함되지 않는다.
+
+### 11.7 Parent-boundary prompt cache
+
+Prompt cache는 병렬성을 위한 barrier가 아니다. Parent가 immediate child world를 boundary commit으로 고정한 직후 child를 그대로 fan-out하며, 같은 parent 아래 같은 역할이 `cache.minFanout` 이상일 때만 cache cohort를 만든다.
+
+Cache prefix에는 다음처럼 sibling에게 실제로 공통인 정적 정보만 포함한다.
+
+- cache protocol version과 role
+- parent node ID와 scope
+- frozen boundary commit
+- 정렬된 immediate child WIT interface summary
+
+실행 중인 child의 node ID, session ID, worktree 절대경로, timestamp와 leaf별 구현 지시는 공통 prefix에 넣지 않는다. Node별 prompt는 이 stable prefix 뒤에 배치한다. Nurse와 Surgeon, 서로 다른 parent boundary, 서로 다른 model/variant는 cache partition을 공유하지 않는다.
+
+Provider cache는 최적화이며 correctness 조건이 아니다. Cache miss가 나도 실행 결과는 동일해야 한다. Runtime은 node별 input/output/reasoning token, cache read/write token과 cost를 수집해 text graph에 표시한다. `promptCacheKey`를 지원하는 provider에는 cohort key를 전달하지만 실제 hit 여부는 provider 응답 telemetry로만 판정한다. Cache warm-up을 기다리는 global primer나 sibling barrier는 만들지 않는다.
 
 ## 12. Recursive Join
 
@@ -938,6 +983,9 @@ Quackery는 agent 수가 아니라 critical path를 줄이는 것을 목표로 �
 - Decomposition model token
 - Implementation model token
 - Strong-model token share
+- Parent-boundary cache-eligible cohort count
+- Cache read/write token과 cache hit ratio
+- Role/model/variant별 cache hit ratio와 input cost
 - Leaf first-pass verification rate
 - Contract 변경으로 폐기된 작업량
 - Ownership violation count
@@ -980,6 +1028,12 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 26. 각 Surgeon은 정확히 하나의 WIT export와 완성된 것으로 취급할 imports를 받는다.
 27. WIT world와 import stub은 child spawn 전에 같은 boundary commit에 고정된다.
 28. Join-owned product code는 child 합성 뒤 별도 Integration LEAF의 Surgeon이 구현한다.
+29. `.quack/config.jsonc`와 local override로 role quality ladder, balance, limit과 cache policy를 설정할 수 있다.
+30. `quality`와 `balanced` profile은 Psychiatrist를 frontier에 두고, Pharmacist/Nurse/Surgeon을 각각 의도된 품질·비용 계층에 배치한다.
+31. 같은 parent boundary의 같은 역할 sibling cohort만 stable cache prefix와 cache group을 공유한다.
+32. Cache prefix에는 실행 중인 child의 node ID, session ID, worktree path, timestamp와 node-specific instructions가 포함되지 않는다.
+33. Text graph는 provider가 반환한 input/output/cache read/cache write/cost telemetry를 집계한다.
+34. Cache warm-up 때문에 Surgeon 또는 Nurse fan-out을 기다리게 하는 global barrier가 없다.
 
 ## 18. Design Invariants
 
@@ -1039,6 +1093,10 @@ Node는 commit에서 시작해 검증된 commit을 반환한다. Worktree, ances
 
 사용자에게 reasoning 양보다 graph 진행률과 검증된 결과를 보여준다.
 
+### Cache common boundaries, never scheduling
+
+Cache key는 같은 model이 같은 frozen boundary를 읽는 sibling cohort의 공통 prefix를 식별한다. Cache 최적화가 fan-out 시작 순서나 correctness를 바꾸어서는 안 된다.
+
 ## 19. Open Implementation Decisions
 
 다음은 core가 아니라 구현 단계에서 결정할 사항이다.
@@ -1054,7 +1112,7 @@ Node는 commit에서 시작해 검증된 commit을 반환한다. Worktree, ances
 - WIT parser와 validator 배포 방식
 - 우선 지원할 target-language WIT projection과 stub generator
 - WIT world와 repository symbol binding 방식
-- Psychiatrist, Pharmacist, Nurse와 Surgeon별 model routing profile
 - 기본 depth, node, retry와 token budget
+- Provider별 explicit cache breakpoint 지원과 live cache-hit 검증
 
 어떤 선택을 하더라도 두 selectable primary agent, Pharmacist-internal parallel Nurses/Surgeons, Git-isolated recursive fan-out, WIT abstract-complete worlds, one-writer ownership, immediate Surgeon execution과 recursive join은 유지해야 한다.

@@ -1,0 +1,8 @@
+{
+  "models": {
+    "frontier": { "model": "provider/frontier-model", "variant": "high" },
+    "strong": { "model": "provider/strong-model", "variant": "high" },
+    "balanced": { "model": "provider/balanced-model", "variant": "medium" },
+    "economy": { "model": "provider/economy-model", "variant": "low" }
+  }
+}
