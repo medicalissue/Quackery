@@ -1,0 +1,27 @@
+{
+  // Project-wide Quackery policy. Concrete provider model IDs normally live
+  // in config.local.jsonc so every developer can use their connected models.
+  "version": 1,
+  "profile": "balanced",
+
+  "cache": {
+    "mode": "auto",
+    "scope": "parent-boundary",
+    "minFanout": 2
+  },
+
+  "balance": {
+    "maxDepthSkew": 1,
+    "maxWorkRatio": 2,
+    "allowJustifiedImbalance": true
+  },
+
+  "limits": {
+    "maxDepth": 6,
+    "maxNodes": 32,
+    "maxNeedsNurseBounces": 1,
+    "maxRunSeconds": 3600,
+    "maxPromptSeconds": 600,
+    "verificationSeconds": 120
+  }
+}

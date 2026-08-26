@@ -1,4 +1,5 @@
 import { z } from "zod"
+import type { ConfirmedIntent } from "./intent.js"
 
 export const ownershipRuleSchema = z.object({
   path: z.string().min(1),
@@ -16,13 +17,14 @@ export const worldRefSchema = z.object({
 export type WorldRef = z.infer<typeof worldRefSchema>
 
 export const nodePlanSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, "must be one safe path segment"),
   kind: z.enum(["scope", "leaf"]),
   scope: z.string().min(1),
   exports: z.array(z.string().min(1)).length(1),
   imports: z.array(z.string().min(1)),
   world: worldRefSchema,
   reads: z.array(z.string().min(1)).default([]),
+  artifacts: z.array(z.string().min(1)).optional(),
   owns: z.array(ownershipRuleSchema).min(1),
   verify: z.array(z.string().min(1)).min(1),
   estimatedRemainingDepth: z.number().int().min(0),
@@ -69,6 +71,21 @@ export type DecompositionDecision = z.infer<typeof decompositionDecisionSchema>
 
 export type NodeRole = "pharmacist" | "nurse" | "surgeon" | "integration-surgeon"
 
+export interface CacheContext {
+  protocol: string
+  group: string
+  prefix: string
+}
+
+export interface TokenUsage {
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+}
+
 export interface NodeContext {
   id: string
   parentId?: string
@@ -79,6 +96,9 @@ export interface NodeContext {
   worktree: string
   baseCommit: string
   boundaryCommit?: string
+  boundaryRoot: string
+  cache?: CacheContext
+  intent?: ConfirmedIntent
 }
 
 export type NodeStatus =
@@ -105,6 +125,7 @@ export interface NodeSuccess {
   changedPaths: string[]
   evidence: VerificationEvidence[]
   actualDepth: number
+  usage?: TokenUsage
 }
 
 export interface NodeFailure {
@@ -114,6 +135,7 @@ export interface NodeFailure {
   detail?: string
   recoverableCommit?: string
   actualDepth: number
+  usage?: TokenUsage
 }
 
 export type NodeResult = NodeSuccess | NodeFailure
@@ -131,17 +153,28 @@ export interface GraphNodeState {
   boundaryCommit?: string
   headCommit?: string
   failure?: string
+  recoverableCommit?: string
+  cacheGroup?: string
+  usage?: TokenUsage
   startedAt?: number
   completedAt?: number
 }
 
 export interface RunSnapshot {
   id: string
+  sessionId?: string
   repository: string
   rootNodeId: string
   invocationBase: string
   resultCommit?: string
-  status: "running" | "verified" | "failed"
+  appliedCommit?: string
+  worktrees?: Array<{ nodeId: string; path: string; branch: string }>
+  cleanup?: {
+    removedWorktrees: string[]
+    removedBranches: string[]
+    failures: string[]
+  }
+  status: "running" | "verified" | "failed" | "interrupted" | "applied"
   nodes: GraphNodeState[]
   createdAt: number
   updatedAt: number

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { NodePlan, SplitDecision } from "../src/model.js"
+import { nodePlanSchema, type NodePlan, type SplitDecision } from "../src/model.js"
 import {
   assertBalancedSplit,
   assertDisjointOwnership,
@@ -41,6 +41,11 @@ function split(children: NodePlan[], imbalanceJustification?: string): SplitDeci
 }
 
 describe("split validation", () => {
+  test("rejects node IDs that could escape or alias worktree paths", () => {
+    expect(nodePlanSchema.safeParse(plan({ id: "../alias", exports: ["alias"] })).success).toBe(false)
+    expect(nodePlanSchema.safeParse(plan({ id: "nested/alias", exports: ["alias"] })).success).toBe(false)
+  })
+
   test("accepts balanced sibling depth and work", () => {
     const children = [
       plan({ id: "a", exports: ["a"], estimatedRemainingDepth: 1, estimatedWork: 2 }),
