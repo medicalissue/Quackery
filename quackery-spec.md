@@ -137,6 +137,27 @@ Nurse와 Surgeon은 `@` autocomplete에서 숨기며 Pharmacist runtime만 호�
 
 질문 수를 늘리는 것이 deep interview가 아니다. 이미 repository와 요청에서 확인 가능한 사실을 다시 묻지 않고, 답이 결과나 graph 구조를 바꾸는 질문만 한다. 명확한 작은 요청은 질문 없이 Intent Contract를 제시할 수 있다.
 
+Interview mechanics는 [OMO Prometheus](https://github.com/ajentik/omo/blob/dev/src/agents/prometheus/interview-mode.ts)의 adaptive interview, explore-before-ask와 clearance-check 원칙을 참고하되 Quackery의 책임 경계에 맞게 축소한다. OMO처럼 implementer가 판단할 일이 전혀 없는 상세 기술 계획을 만드는 것이 아니라, 이후 Pharmacist가 interface boundary를 결정하는 데 필요한 **intent만 decision-complete**하게 만든다.
+
+Psychiatrist는 요청을 먼저 다음 깊이로 분류한다.
+
+- `trivial`: repository 확인 뒤 inferred contract를 바로 제시하며 질문을 만들지 않는다.
+- `focused`: 결과를 바꾸는 모호함 하나에 대해 작은 decision cluster만 묻는다.
+- `complex`: evidence-backed 질문과 clearance check를 반복한다.
+
+Refactor에서는 보존 behavior와 regression boundary, 새 feature에서는 minimum observable version과 explicit exclusion, bug fix에서는 reproduction과 regression proof, architecture/research에서는 work가 내려야 할 decision과 exit criterion에 집중한다. 이 분류는 인터뷰 깊이만 바꾸며 implementation graph를 미리 설계하지 않는다.
+
+각 meaningful exchange 뒤 다음 clearance gate를 평가한다.
+
+1. Core objective가 명확하다.
+2. Observable outcome이 구체적이다.
+3. In-scope와 out-of-scope가 scope drift를 막을 만큼 명확하다.
+4. Compatibility와 hard constraint가 확인됐다.
+5. Acceptance evidence가 executable하거나 객관적으로 inspectable하다.
+6. Interface 또는 ownership boundary를 바꿀 unresolved question이 없다.
+
+하나라도 통과하지 못하면 그 blocker만 `CLARIFY`한다. 모두 통과하면 상세 implementation plan이 아니라 Intent Contract를 `READY`로 제시한다. OMO의 Metis/Momus plan-review chain, single giant task plan과 technical approach clearance는 도입하지 않는다. 그것들은 강한 planner의 직렬 critical path를 다시 만들고 Pharmacist/Nurse의 local decomposition 책임을 침범하기 때문이다.
+
 Psychiatrist는 다음 중 하나를 반환한다.
 
 ```text
