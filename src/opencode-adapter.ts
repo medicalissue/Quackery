@@ -374,9 +374,12 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     const abortFromParent = (): void => controller.abort(parent?.reason)
     if (parent?.aborted) abortFromParent()
     else parent?.addEventListener("abort", abortFromParent, { once: true })
+    const configuredMs = this.options.timeouts?.promptMs ?? 600_000
+    const remainingMs = this.options.deadlineMs ? this.options.deadlineMs - Date.now() : undefined
+    const deadlineLimited = remainingMs !== undefined && remainingMs <= configuredMs
     const timeout = setTimeout(
-      () => controller.abort(new Error("OpenCode request timeout")),
-      this.boundedTimeout(this.options.timeouts?.promptMs ?? 600_000),
+      () => controller.abort(new Error(deadlineLimited ? "Maximum run time deadline exceeded" : "OpenCode request timeout")),
+      this.boundedTimeout(configuredMs),
     )
     return {
       signal: controller.signal,

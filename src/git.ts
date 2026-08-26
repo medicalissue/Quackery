@@ -187,7 +187,7 @@ export class GitWorkspaceManager {
     const evidence: VerificationEvidence[] = []
     for (const command of commands) {
       try {
-        const result = await execute("/bin/zsh", ["-lc", command], { cwd: worktree, timeout })
+        const result = await execute("/bin/sh", ["-lc", command], { cwd: worktree, timeout })
         evidence.push({ command, exitCode: 0, output: `${result.stdout}${result.stderr}`.trim().slice(-20_000) })
       } catch (error) {
         if (error instanceof CommandError) {
@@ -204,7 +204,10 @@ export class GitWorkspaceManager {
   async cherryPick(nodeId: string, commits: string[]): Promise<void> {
     const worktree = this.get(nodeId).path
     for (const commit of commits) {
-      await git(worktree, ["cherry-pick", commit])
+      await git(worktree, [
+        "-c", "user.name=Quackery", "-c", "user.email=quackery@local",
+        "cherry-pick", commit,
+      ])
     }
   }
 
@@ -242,7 +245,10 @@ export class GitWorkspaceManager {
       throw new Error(`Invocation branch moved from ${invocationBase} to ${current}; result was preserved at ${resultCommit}`)
     }
     try {
-      await git(this.repository, ["cherry-pick", resultCommit])
+      await git(this.repository, [
+        "-c", "user.name=Quackery", "-c", "user.email=quackery@local",
+        "cherry-pick", resultCommit,
+      ])
     } catch (error) {
       try {
         await git(this.repository, ["cherry-pick", "--abort"])
