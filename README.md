@@ -6,7 +6,21 @@ Its execution rule is:
 
 > Freeze the world. Fill one hole.
 
-Pharmacist creates only the root boundary. Parallel Nurses recursively create balanced immediate child worlds. Each cheap Surgeon receives a WIT world whose imports are treated as already implemented and fills exactly one export in an isolated Git worktree.
+The selected Pharmacist creates only a high-level, Nurse-only root boundary from the current checkout. Parallel Nurses recursively delegate atomic holes to Surgeons and ambiguous deltas to more Nurses. Each cheap Surgeon receives a WIT world whose imports are treated as already implemented and fills exactly one export in an isolated Git worktree.
+
+## Install
+
+Add the npm package to the global OpenCode configuration at `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["quackery-opencode"]
+}
+```
+
+OpenCode resolves and caches npm plugins from this list. No Quackery-specific `npx`, install script, slash command, or custom TUI is required. Provider authentication plugins may remain alongside Quackery; they are transports, not agent harnesses.
+
+Restart OpenCode, select `Psychiatrist` or `Pharmacist` with `Tab`/`Shift+Tab`, and run `quackery_doctor` before the first implementation QA.
 
 ## Development
 
@@ -17,7 +31,7 @@ bun run verify
 
 ## OpenCode configuration
 
-During local development, point OpenCode at the built package or publish it and add the package name to `opencode.json`:
+During local development, point OpenCode at the built package. For published-package use, add the package name to `opencode.json`:
 
 ```json
 {
@@ -60,6 +74,6 @@ Prompt caching is grouped by frozen parent boundary and role. Eligible same-role
 
 ## Current boundary
 
-The core runtime, Git worktree topology, balanced recursive fan-out, ownership validation, canonical WIT parsing plus Quackery's one-export world policy, revisioned Intent Contract handoff, isolated boundary writing, leaf- and integration-local `NEEDS_NURSE` decomposition, product-only result commits, recursive join, role model routing, cache grouping/telemetry, text graph, restart-safe status/apply, and post-apply cleanup are implemented and testable without a model provider. A child starts as soon as its own worktree is ready; creation of later sibling worktrees is not a decomposition barrier. CI repeats type checking, the fake-provider/real-Git suite, build, and package inspection.
+The core runtime, checkout-free synthetic root boundary, Nurse-only root fan-out, Git child-worktree topology, balanced recursive fan-out, ownership validation, canonical WIT parsing plus Quackery's one-export world policy, revisioned Intent Contract handoff, isolated Nurse boundary writing, leaf- and integration-local `NEEDS_NURSE` decomposition, product-only result commits, recursive join, role model routing, cache grouping/telemetry, text graph, restart-safe status/apply, and post-apply cleanup are implemented and testable without a model provider. A child starts as soon as its own worktree is ready; creation of later sibling worktrees is not a decomposition barrier. CI repeats type checking, the fake-provider/real-Git suite, build, and package inspection.
 
 An interrupted process is recovered as inspectable `interrupted` state with its branches and worktrees preserved; it is not automatically resumed. The current WIT policy intentionally supports local interfaces; broader package-qualified worlds are future work. Live OpenCode model execution, provider/model reachability, actual provider cache hits, strict provider-side token/cost caps, and crash-time session resumption remain `UNKNOWN` or future work until measured.

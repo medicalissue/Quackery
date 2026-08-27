@@ -26,6 +26,34 @@ test("run timeout aborts a signal-aware OpenCode request and persists failure", 
     sessionId: "timeout-parent",
     goal: "timeout",
     intent: intent(repository, base),
+    rootDecision: {
+      kind: "split",
+      children: [{
+        id: "timeout-work",
+        kind: "scope",
+        scope: "timeout work",
+        exports: ["timeout-work"],
+        imports: [],
+        world: { witPath: "world.wit", world: "timeout-nurse", behaviorPath: "behavior.md" },
+        reads: [],
+        artifacts: [],
+        owns: [{ path: "src/timeout", mode: "prefix" }],
+        verify: ["true"],
+        estimatedRemainingDepth: 1,
+        estimatedWork: 1,
+      }],
+      join: { verify: [] },
+    },
+    artifacts: [
+      {
+        path: "world.wit",
+        content: `package quackery:timeout@0.1.0;
+          interface timeout-work { run: func(); }
+          world timeout-nurse { export timeout-work; }
+        `,
+      },
+      { path: "behavior.md", content: "# timeout\n" },
+    ],
     client: {
       session: {
         create: async () => ({ data: { id: "timeout-session" } }),
@@ -40,7 +68,7 @@ test("run timeout aborts a signal-aware OpenCode request and persists failure", 
   const result = await handle.promise
   expect(result.ok).toBe(false)
   if (result.ok) return
-  expect(result.reason).toBe("Decomposition failed")
+  expect(result.reason).toBe("Child root/timeout-work failed: Decomposition failed")
   expect(result.detail).toContain("Maximum run time")
   const recovered = await new RunRegistry().snapshot(repository, handle.id, "timeout-parent")
   expect(recovered.status).toBe("failed")

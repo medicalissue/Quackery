@@ -1,7 +1,7 @@
 import { relative, resolve } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import type { NodeContext } from "./model.js"
+import { boundaryArtifactSchema, rootSplitDecisionSchema, type NodeContext } from "./model.js"
 import { cachePartitionKey } from "./cache.js"
 import { configuredRoleModel, loadQuackConfig, type ModelRole, type QuackConfig, type ResolvedRoleModel } from "./config.js"
 import { pharmacistPrompt, psychiatristPrompt, nursePrompt, surgeonPrompt } from "./prompts.js"
@@ -39,6 +39,45 @@ function repositoryRelativePath(node: NodeContext, value: string): string {
 
 const modelRoles: ModelRole[] = ["psychiatrist", "pharmacist", "nurse", "surgeon"]
 
+const rootOwnershipToolSchema = tool.schema.object({
+  path: tool.schema.string().min(1),
+  mode: tool.schema.enum(["exact", "prefix"]),
+})
+
+const rootNursePlanToolSchema = tool.schema.object({
+  id: tool.schema.string().min(1),
+  kind: tool.schema.literal("scope"),
+  scope: tool.schema.string().min(1),
+  exports: tool.schema.array(tool.schema.string().min(1)).length(1),
+  imports: tool.schema.array(tool.schema.string().min(1)),
+  world: tool.schema.object({
+    witPath: tool.schema.string().min(1),
+    world: tool.schema.string().min(1),
+    behaviorPath: tool.schema.string().min(1),
+  }),
+  reads: tool.schema.array(tool.schema.string().min(1)).default([]),
+  artifacts: tool.schema.array(tool.schema.string().min(1)).optional(),
+  owns: tool.schema.array(rootOwnershipToolSchema).min(1),
+  verify: tool.schema.array(tool.schema.string().min(1)).min(1),
+  estimatedRemainingDepth: tool.schema.number().int().min(0),
+  estimatedWork: tool.schema.number().positive(),
+})
+
+const rootDecisionToolSchema = tool.schema.object({
+  kind: tool.schema.literal("split"),
+  children: tool.schema.array(rootNursePlanToolSchema).min(1),
+  join: tool.schema.object({
+    integration: rootNursePlanToolSchema.optional(),
+    verify: tool.schema.array(tool.schema.string().min(1)).default([]),
+  }),
+  imbalanceJustification: tool.schema.string().min(1).optional(),
+})
+
+const boundaryArtifactToolSchema = tool.schema.object({
+  path: tool.schema.string().min(1),
+  content: tool.schema.string(),
+})
+
 function preservedAgentTuning(agent: any): Record<string, unknown> {
   if (!agent || typeof agent !== "object") return {}
   return Object.fromEntries(
@@ -58,6 +97,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
       permission: {
         edit: "deny",
         task: "deny",
+        "quackery_*": "deny",
         "quackery_intent_confirm": "allow",
         bash: "deny",
       },
@@ -67,7 +107,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
       mode: "primary",
       prompt: pharmacistPrompt,
       permission: {
-        edit: "allow",
+        edit: "deny",
         bash: "deny",
         task: "deny",
         "quackery_*": "allow",
@@ -82,6 +122,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
         edit: "allow",
         bash: "deny",
         task: "deny",
+        "quackery_*": "deny",
       },
     },
     surgeon: {
@@ -93,6 +134,7 @@ export function agentConfiguration(config: any, quack: QuackConfig): Record<Mode
         edit: "allow",
         bash: "deny",
         task: "deny",
+        "quackery_*": "deny",
       },
     },
   }
@@ -142,7 +184,7 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
   const intents = new IntentRegistry()
   const authorizedSessions = new Map<string, {
     node: NodeContext
-    agent: "pharmacist" | "nurse" | "surgeon"
+    agent: "nurse" | "surgeon"
   }>()
   const pharmacistSessions = new Set<string>()
   let effectiveModels = Object.fromEntries(
@@ -152,7 +194,7 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
   const authorizeSession = (
     sessionId: string,
     node: NodeContext,
-    agent: "pharmacist" | "nurse" | "surgeon",
+    agent: "nurse" | "surgeon",
   ): void => {
     authorizedSessions.set(sessionId, { node, agent })
   }
@@ -175,7 +217,7 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
       const node = authorizedSessions.get(input.sessionID)?.node
       if (!node?.cache || quack.cache.mode === "off") return
       if (input.model.providerID === "openai" || input.provider.options.setCacheKey === true) {
-        const role = node.role === "integration-surgeon" ? "surgeon" : node.role
+        const role = node.role
         const variant = role === "nurse" || role === "surgeon" ? effectiveModels[role].variant : undefined
         output.options.promptCacheKey = cachePartitionKey(
           node.cache,
@@ -243,10 +285,12 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
       }),
 
       quackery_start: tool({
-        description: "Start a background Quackery run. Pharmacist calls this once after intent is fixed.",
+        description: "Freeze Pharmacist's root Nurse split and start the background Quackery runtime.",
         args: {
           intentRevision: tool.schema.string().min(1).optional(),
           directGoal: tool.schema.string().min(1).optional(),
+          rootDecision: rootDecisionToolSchema,
+          artifacts: tool.schema.array(boundaryArtifactToolSchema).min(1),
           maxDepth: tool.schema.number().int().min(1).max(12).optional(),
           maxNodes: tool.schema.number().int().min(1).max(128).optional(),
         },
@@ -266,11 +310,16 @@ export const QuackeryPlugin: Plugin = async ({ client, directory }, options) => 
                 assumptions: ["Direct Pharmacist request; no Psychiatrist interview was required"],
               })
             : await intents.resolve(context.directory, context.sessionID, args.intentRevision)
+          const rootDecision = rootSplitDecisionSchema.parse(args.rootDecision)
+          const artifacts = tool.schema.array(boundaryArtifactToolSchema).parse(args.artifacts)
+          const parsedArtifacts = boundaryArtifactSchema.array().parse(artifacts)
           const handle = await registry.start({
             directory: context.directory,
             sessionId: context.sessionID,
             goal: intent.goal,
             intent,
+            rootDecision,
+            artifacts: parsedArtifacts,
             client,
             authorizeSession,
             policy: {

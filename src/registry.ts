@@ -1,11 +1,23 @@
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises"
-import { resolve } from "node:path"
-import type { NodeContext, NodeResult, RunSnapshot } from "./model.js"
+import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
+import { dirname, resolve } from "node:path"
+import { tmpdir } from "node:os"
+import {
+  boundaryArtifactSchema,
+  rootSplitDecisionSchema,
+  type BoundaryArtifact,
+  type NodeContext,
+  type NodePlan,
+  type NodeResult,
+  type RootSplitDecision,
+  type RunSnapshot,
+  type SplitDecision,
+} from "./model.js"
 import type { ConfirmedIntent } from "./intent.js"
 import { RunGraph } from "./graph.js"
 import { git, GitWorkspaceManager, repositoryRoot } from "./git.js"
 import { OpenCodeExecutionAdapter } from "./opencode-adapter.js"
-import { RecursiveRuntime, type RuntimePolicy } from "./runtime.js"
+import { assertSplitContract, RecursiveRuntime, type RuntimePolicy } from "./runtime.js"
+import { assertNodeWorldMatchesWit, normalizeOwnedPath, resolveRepositoryPath } from "./validation.js"
 
 type Client = ConstructorParameters<typeof OpenCodeExecutionAdapter>[0]["client"]
 
@@ -24,8 +36,10 @@ export interface StartRunInput {
   sessionId: string
   goal: string
   client: Client
-  authorizeSession(sessionId: string, node: NodeContext, agent: "pharmacist" | "nurse" | "surgeon"): void
+  authorizeSession(sessionId: string, node: NodeContext, agent: "nurse" | "surgeon"): void
   intent: ConfirmedIntent
+  rootDecision: RootSplitDecision
+  artifacts: BoundaryArtifact[]
   policy?: Partial<RuntimePolicy>
   cache?: {
     enabled: boolean
@@ -35,6 +49,77 @@ export interface StartRunInput {
     runMs: number
     promptMs: number
     verificationMs: number
+  }
+}
+
+function materializeRootInput(
+  boundaryRoot: string,
+  decision: RootSplitDecision,
+  artifacts: BoundaryArtifact[],
+): { decision: SplitDecision; artifacts: BoundaryArtifact[] } {
+  const normalizedArtifacts = artifacts.map((artifact) => ({
+    path: normalizeOwnedPath(artifact.path),
+    content: artifact.content,
+  }))
+  const artifactPaths = new Set(normalizedArtifacts.map((artifact) => artifact.path))
+  if (artifactPaths.size !== normalizedArtifacts.length) throw new Error("Root boundary artifact paths must be unique")
+  const materializedPath = (path: string): string => `${boundaryRoot}/${normalizeOwnedPath(path)}`
+  const requireArtifact = (path: string, label: string): string => {
+    const normalized = normalizeOwnedPath(path)
+    if (!artifactPaths.has(normalized)) throw new Error(`${label} ${normalized} has no matching root artifact`)
+    return materializedPath(normalized)
+  }
+  const materializePlan = (plan: NodePlan): NodePlan => {
+    const planArtifacts = (plan.artifacts ?? []).map((path) => requireArtifact(path, "Plan artifact"))
+    return {
+      ...plan,
+      world: {
+        ...plan.world,
+        witPath: requireArtifact(plan.world.witPath, "WIT path"),
+        behaviorPath: requireArtifact(plan.world.behaviorPath, "Behavior path"),
+      },
+      reads: plan.reads.map((path) => {
+        const normalized = normalizeOwnedPath(path)
+        return artifactPaths.has(normalized) ? materializedPath(normalized) : normalized
+      }),
+      ...(plan.artifacts ? { artifacts: planArtifacts } : {}),
+    }
+  }
+  return {
+    decision: {
+      ...decision,
+      children: decision.children.map(materializePlan),
+      join: {
+        ...decision.join,
+        ...(decision.join.integration ? { integration: materializePlan(decision.join.integration) } : {}),
+      },
+    },
+    artifacts: normalizedArtifacts.map((artifact) => ({
+      path: materializedPath(artifact.path),
+      content: artifact.content,
+    })),
+  }
+}
+
+async function validateMaterializedBoundary(
+  decision: SplitDecision,
+  artifacts: BoundaryArtifact[],
+): Promise<void> {
+  const staging = await mkdtemp(resolve(tmpdir(), "quackery-root-boundary-"))
+  try {
+    for (const artifact of artifacts) {
+      const path = resolveRepositoryPath(staging, artifact.path)
+      await mkdir(dirname(path), { recursive: true })
+      await writeFile(path, artifact.content, "utf8")
+    }
+    const plans = [...decision.children, ...(decision.join.integration ? [decision.join.integration] : [])]
+    for (const plan of plans) {
+      await assertNodeWorldMatchesWit(staging, plan)
+      await access(resolveRepositoryPath(staging, plan.world.behaviorPath))
+      for (const artifact of plan.artifacts ?? []) await access(resolveRepositoryPath(staging, artifact))
+    }
+  } finally {
+    await rm(staging, { recursive: true, force: true })
   }
 }
 
@@ -60,18 +145,19 @@ class RunStateStore {
 
   async write(snapshot: RunSnapshot): Promise<void> {
     const value = structuredClone(snapshot)
-    const path = await this.path(value.repository, value.id)
-    const previous = this.writes.get(path) ?? Promise.resolve()
+    const key = `${value.repository}\0${value.id}`
+    const previous = this.writes.get(key) ?? Promise.resolve()
     const next = previous.catch(() => undefined).then(async () => {
+      const path = await this.path(value.repository, value.id)
       const temporary = `${path}.${crypto.randomUUID()}.tmp`
       await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8")
       await rename(temporary, path)
     })
-    this.writes.set(path, next)
+    this.writes.set(key, next)
     try {
       await next
     } finally {
-      if (this.writes.get(path) === next) this.writes.delete(path)
+      if (this.writes.get(key) === next) this.writes.delete(key)
     }
   }
 
@@ -132,17 +218,27 @@ export class RunRegistry {
     const id = runId()
     const manager = new GitWorkspaceManager(repository, id)
     const invocationBase = await manager.initialize()
-    const rootRecord = await manager.create("root", invocationBase)
+    const intentRepository = await repositoryRoot(input.intent.repository)
+    if (intentRepository !== repository || input.intent.repositoryBase !== invocationBase) {
+      throw new Error("Intent Contract does not match the current repository base")
+    }
     const root: NodeContext = {
       id: "root",
       depth: 0,
       role: "pharmacist",
       scope: input.goal,
-      worktree: rootRecord.path,
+      worktree: repository,
       baseCommit: invocationBase,
       boundaryRoot: manager.boundaryRoot("root"),
       intent: input.intent,
     }
+    const rootDecision = rootSplitDecisionSchema.parse(input.rootDecision)
+    const artifacts = boundaryArtifactSchema.array().min(1).parse(input.artifacts)
+    const materialized = materializeRootInput(root.boundaryRoot, rootDecision, artifacts)
+    assertSplitContract(undefined, materialized.decision, { ...defaultPolicy, ...input.policy })
+    await validateMaterializedBoundary(materialized.decision, materialized.artifacts)
+    const rootBoundary = await manager.createSyntheticBoundary(invocationBase, materialized.artifacts)
+    root.boundaryCommit = rootBoundary
     const graph = new RunGraph({ id, sessionId: input.sessionId, repository, root, invocationBase })
     const controller = new AbortController()
     const runMs = input.timeouts?.runMs ?? 3_600_000
@@ -160,6 +256,7 @@ export class RunRegistry {
       },
     })
     const runtime = new RecursiveRuntime(graph, adapter, { ...defaultPolicy, ...input.policy })
+    adapter.seedBoundary(root, rootBoundary, materialized.decision)
     let handle!: RunHandle
     const persist = async (): Promise<void> => {
       await this.store.write({ ...graph.snapshot, worktrees: manager.recordsSnapshot() })
@@ -173,7 +270,7 @@ export class RunRegistry {
     )
     runTimeout.unref()
     const promise = Promise.resolve()
-      .then(() => runtime.execute(root))
+      .then(() => runtime.executeRoot(root, materialized.decision, rootBoundary))
       .then(async (result) => {
         await persist()
         return result

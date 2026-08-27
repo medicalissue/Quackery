@@ -66,10 +66,33 @@ export const decompositionDecisionSchema = z.discriminatedUnion("kind", [
 
 export type LeafDecision = z.infer<typeof leafDecisionSchema>
 export type SplitDecision = z.infer<typeof splitDecisionSchema>
+
+const rootNursePlanSchema = nodePlanSchema.extend({
+  kind: z.literal("scope"),
+})
+
+export const rootSplitDecisionSchema = z.object({
+  kind: z.literal("split"),
+  children: z.array(rootNursePlanSchema).min(1),
+  join: z.object({
+    integration: rootNursePlanSchema.optional(),
+    verify: z.array(z.string().min(1)).default([]),
+  }),
+  imbalanceJustification: z.string().min(1).optional(),
+})
+
+export type RootSplitDecision = z.infer<typeof rootSplitDecisionSchema>
+
+export const boundaryArtifactSchema = z.object({
+  path: z.string().min(1),
+  content: z.string(),
+}).strict()
+
+export type BoundaryArtifact = z.infer<typeof boundaryArtifactSchema>
 export type RefuseDecision = z.infer<typeof refuseDecisionSchema>
 export type DecompositionDecision = z.infer<typeof decompositionDecisionSchema>
 
-export type NodeRole = "pharmacist" | "nurse" | "surgeon" | "integration-surgeon"
+export type NodeRole = "pharmacist" | "nurse" | "surgeon"
 
 export interface CacheContext {
   protocol: string

@@ -52,7 +52,7 @@ export interface OpenCodeAdapterOptions {
   client: Client
   git: GitWorkspaceManager
   parentSessionId: string
-  authorizeSession(sessionId: string, node: NodeContext, agent: "pharmacist" | "nurse" | "surgeon"): void
+  authorizeSession(sessionId: string, node: NodeContext, agent: "nurse" | "surgeon"): void
   cache: {
     enabled: boolean
     minFanout: number
@@ -74,10 +74,10 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
 
   async decompose(node: NodeContext): Promise<DecompositionDecision> {
     this.assertActive()
-    const agent = node.depth === 0 ? "pharmacist" : "nurse"
-    const sessionId = await this.createSession(node, agent, `${agent} · ${node.scope}`)
+    if (node.role !== "nurse") throw new Error(`Only a Nurse node may decompose; received ${node.role}`)
+    const sessionId = await this.createSession(node, "nurse", `nurse · ${node.scope}`)
     this.decompositionSessions.set(node.id, sessionId)
-    const response = await this.prompt(node, sessionId, agent, decompositionPrompt(node))
+    const response = await this.prompt(node, sessionId, "nurse", decompositionPrompt(node))
     return decompositionDecisionSchema.parse(parseJsonResponse(response))
   }
 
@@ -98,6 +98,14 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     this.assertBoundaryArtifactPaths(node, decision, plans)
     const commit = await this.options.git.commitAll(node.id, `quackery(${node.id}): freeze abstract worlds`)
     await this.options.git.assertOwned(node.id, node.baseCommit, [{ path: node.boundaryRoot, mode: "prefix" }], commit)
+    this.seedBoundary(node, commit, decision)
+    // The separate Surgeon created for a Nurse LEAF handoff must not inherit
+    // the Nurse node's cache partition.
+    if (decision.kind === "leaf") delete node.cache
+    return commit
+  }
+
+  seedBoundary(node: NodeContext, commit: string, decision: DecompositionDecision): void {
     const seed = boundaryCacheSeed(node, commit, decision)
     const cacheRoles = new Set<"nurse" | "surgeon">()
     if (this.options.cache.enabled && decision.kind === "split") {
@@ -107,10 +115,6 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       if (surgeonCount >= this.options.cache.minFanout) cacheRoles.add("surgeon")
     }
     this.boundaries.set(node.id, { seed, cacheRoles })
-    // A locally decomposed leaf changes role from Nurse to Surgeon and must not
-    // reuse the Nurse cohort's cache partition.
-    if (decision.kind === "leaf") delete node.cache
-    return commit
   }
 
   async forkChild(parent: NodeContext, boundaryCommit: string, plan: NodePlan): Promise<NodeContext> {
@@ -224,6 +228,10 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
 
   async prepareJoin(node: NodeContext, children: NodeSuccess[]): Promise<string> {
     this.assertActive()
+    if (!this.options.git.has(node.id)) {
+      const record = await this.options.git.create(node.id, node.boundaryCommit ?? node.baseCommit)
+      node.worktree = record.path
+    }
     await this.options.git.cherryPick(node.id, children.map((child) => child.headCommit))
     return this.options.git.head(node.id)
   }
@@ -295,8 +303,8 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     decision: DecompositionDecision,
     plans: NodePlan[],
   ): void {
-    // A non-root LEAF must reuse its inherited world. SPLITs and root LEAFs
-    // create new boundary artifacts only in this node's reserved namespace.
+    // A Nurse LEAF handoff must reuse its inherited world. Nurse SPLITs create
+    // new boundary artifacts only in this node's reserved namespace.
     if (decision.kind === "leaf" && node.plan) return
     const boundary = { path: node.boundaryRoot, mode: "prefix" as const }
     for (const plan of plans) {
@@ -311,7 +319,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
 
   private async createSession(
     node: NodeContext,
-    agent: "pharmacist" | "nurse" | "surgeon",
+    agent: "nurse" | "surgeon",
     title: string,
   ): Promise<string> {
     // A Surgeon spawned after this node's Nurse must be a child of that Nurse.

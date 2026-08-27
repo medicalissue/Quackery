@@ -24,6 +24,45 @@ export interface RuntimeLimits {
 
 export interface RuntimePolicy extends BalancePolicy, RuntimeLimits {}
 
+export function assertSplitContract(
+  parentPlan: NodePlan | undefined,
+  decision: SplitDecision,
+  policy: BalancePolicy,
+): void {
+  const childIds = decision.children.map((child) => child.id)
+  if (new Set(childIds).size !== childIds.length) throw new Error("Split child IDs must be unique")
+  if (decision.join.integration && childIds.includes(decision.join.integration.id)) {
+    throw new Error("Integration ID must not collide with a child ID")
+  }
+  assertBalancedSplit(decision, policy)
+  assertDisjointOwnership(decision.children, decision.join.integration?.owns ?? [])
+  assertWorldWiring(parentPlan, decision.children)
+  if (parentPlan) {
+    for (const child of decision.children) {
+      assertOwnershipWithinParent(parentPlan.owns, child.owns, child.id)
+    }
+    if (decision.join.integration) {
+      assertOwnershipWithinParent(parentPlan.owns, decision.join.integration.owns, decision.join.integration.id)
+    }
+    const parentExport = parentPlan.exports[0]
+    const realizedExport = decision.join.integration?.exports[0]
+      ?? decision.children.find((child) => child.exports[0] === parentExport)?.exports[0]
+    if (realizedExport !== parentExport) {
+      throw new Error(`Split does not realize inherited export ${parentExport}`)
+    }
+  }
+  const integration = decision.join.integration
+  if (integration) {
+    const available = new Set([
+      ...decision.children.map((child) => child.exports[0]).filter(Boolean),
+      ...(parentPlan?.imports ?? []),
+    ])
+    for (const imported of integration.imports) {
+      if (!available.has(imported)) throw new Error(`Integration imports unresolved interface ${imported}`)
+    }
+  }
+}
+
 export interface ExecutionAdapter {
   decompose(node: NodeContext): Promise<DecompositionDecision>
   commitBoundary(node: NodeContext, decision: DecompositionDecision): Promise<string>
@@ -50,8 +89,16 @@ export class RecursiveRuntime {
     private readonly policy: RuntimePolicy,
   ) {}
 
-  async execute(root: NodeContext): Promise<NodeResult> {
-    const result = await this.executeNode(root)
+  async executeRoot(root: NodeContext, decision: SplitDecision, boundaryCommit: string): Promise<NodeResult> {
+    let result: NodeResult
+    try {
+      assertSplitContract(undefined, decision, this.policy)
+      root.boundaryCommit = boundaryCommit
+      this.graph.transition(root.id, "boundary", { boundaryCommit })
+      result = await this.executeSplit(root, decision, boundaryCommit)
+    } catch (error) {
+      result = this.failed(root, "Invalid root contract", error)
+    }
     if (result.ok) this.graph.finish(result.headCommit)
     else this.graph.fail()
     return result
@@ -87,7 +134,7 @@ export class RecursiveRuntime {
     }
 
     try {
-      if (decision.kind === "split") this.validateSplit(node, decision)
+      if (decision.kind === "split") assertSplitContract(node.plan, decision, this.policy)
       else this.validateLeaf(node, decision.leaf)
     } catch (error) {
       return this.failed(node, "Invalid split contract", error)
@@ -103,13 +150,17 @@ export class RecursiveRuntime {
     }
 
     if (decision.kind === "leaf") {
-      node.plan = decision.leaf
-      return this.executeLeaf(node, boundaryCommit, {
-        estimatedRemainingDepth: decision.leaf.estimatedRemainingDepth,
-        estimatedWork: decision.leaf.estimatedWork,
-      })
+      return this.delegateLeaf(node, decision.leaf, boundaryCommit)
     }
 
+    return this.executeSplit(node, decision, boundaryCommit)
+  }
+
+  private async executeSplit(
+    node: NodeContext,
+    decision: SplitDecision,
+    boundaryCommit: string,
+  ): Promise<NodeResult> {
     const childPromises: Promise<NodeResult>[] = []
     try {
       for (const plan of decision.children) {
@@ -132,7 +183,7 @@ export class RecursiveRuntime {
     const childResults = await Promise.all(childPromises)
     const failed = childResults.find((result) => !result.ok)
     if (failed && !failed.ok) {
-      return this.failed(node, `Child ${failed.nodeId} failed: ${failed.reason}`)
+      return this.failed(node, `Child ${failed.nodeId} failed: ${failed.reason}`, failed.detail)
     }
 
     this.graph.transition(node.id, "joining")
@@ -157,7 +208,6 @@ export class RecursiveRuntime {
       } catch (error) {
         return this.failed(node, "Integration worktree creation failed", error)
       }
-      integrationNode.role = "integration-surgeon"
       delete integrationNode.cache
       this.graph.add(integrationNode)
       const result = await this.executeNode(integrationNode)
@@ -185,6 +235,34 @@ export class RecursiveRuntime {
     } catch (error) {
       return this.failed(node, "Recursive join failed", error)
     }
+  }
+
+  private async delegateLeaf(node: NodeContext, plan: NodePlan, boundaryCommit: string): Promise<NodeResult> {
+    if (this.nodeCount >= this.policy.maxNodes) {
+      return this.failed(node, `Maximum node count ${this.policy.maxNodes} exceeded before Surgeon handoff`)
+    }
+    this.nodeCount += 1
+    let surgeon: NodeContext
+    try {
+      surgeon = await this.adapter.forkChild(node, boundaryCommit, plan)
+    } catch (error) {
+      return this.failed(node, "Surgeon worktree creation failed", error)
+    }
+    if (surgeon.role !== "surgeon") {
+      return this.failed(node, `Nurse LEAF handoff ${plan.id} did not create a Surgeon`)
+    }
+    this.graph.add(surgeon)
+    const result = await this.executeNode(surgeon)
+    if (!result.ok) return this.failed(node, `Surgeon ${result.nodeId} failed: ${result.reason}`, result.detail)
+    this.graph.transition(node.id, "joining")
+    const delegated: NodeSuccess = {
+      ...result,
+      nodeId: node.id,
+      baseCommit: node.baseCommit,
+      actualDepth: 1 + result.actualDepth,
+    }
+    this.recordResult(node, delegated)
+    return delegated
   }
 
   private async executeLeaf(
@@ -220,41 +298,6 @@ export class RecursiveRuntime {
     }
     this.recordResult(node, result)
     return result
-  }
-
-  private validateSplit(node: NodeContext, decision: SplitDecision): void {
-    const childIds = decision.children.map((child) => child.id)
-    if (new Set(childIds).size !== childIds.length) throw new Error("Split child IDs must be unique")
-    if (decision.join.integration && childIds.includes(decision.join.integration.id)) {
-      throw new Error("Integration ID must not collide with a child ID")
-    }
-    assertBalancedSplit(decision, this.policy)
-    assertDisjointOwnership(decision.children, decision.join.integration?.owns ?? [])
-    assertWorldWiring(node.plan, decision.children)
-    if (node.plan) {
-      for (const child of decision.children) {
-        assertOwnershipWithinParent(node.plan.owns, child.owns, child.id)
-      }
-      if (decision.join.integration) {
-        assertOwnershipWithinParent(node.plan.owns, decision.join.integration.owns, decision.join.integration.id)
-      }
-      const parentExport = node.plan.exports[0]
-      const realizedExport = decision.join.integration?.exports[0]
-        ?? decision.children.find((child) => child.exports[0] === parentExport)?.exports[0]
-      if (realizedExport !== parentExport) {
-        throw new Error(`Split does not realize inherited export ${parentExport}`)
-      }
-    }
-    const integration = decision.join.integration
-    if (integration) {
-      const available = new Set([
-        ...decision.children.map((child) => child.exports[0]).filter(Boolean),
-        ...(node.plan?.imports ?? []),
-      ])
-      for (const imported of integration.imports) {
-        if (!available.has(imported)) throw new Error(`Integration imports unresolved interface ${imported}`)
-      }
-    }
   }
 
   private validateLeaf(node: NodeContext, leaf: NodePlan): void {

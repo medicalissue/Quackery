@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process"
 import { createHash } from "node:crypto"
-import { access, mkdir, mkdtemp, rm, rmdir } from "node:fs/promises"
+import { access, mkdir, mkdtemp, rm, rmdir, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
-import type { OwnershipRule, VerificationEvidence } from "./model.js"
-import { assertChangedPathsOwned } from "./validation.js"
+import type { BoundaryArtifact, OwnershipRule, VerificationEvidence } from "./model.js"
+import { assertChangedPathsOwned, normalizeOwnedPath } from "./validation.js"
 
 const execFileAsync = promisify(execFile)
 
@@ -102,6 +102,51 @@ export class GitWorkspaceManager {
     const record = { nodeId, path, branch }
     this.records.set(nodeId, record)
     return record
+  }
+
+  has(nodeId: string): boolean {
+    return this.records.has(nodeId)
+  }
+
+  async createSyntheticBoundary(baseCommit: string, artifacts: BoundaryArtifact[]): Promise<string> {
+    if (artifacts.length === 0) throw new Error("A root boundary requires at least one artifact")
+    const normalized = artifacts.map((artifact) => ({
+      path: normalizeOwnedPath(artifact.path),
+      content: artifact.content,
+    }))
+    const unique = new Set(normalized.map((artifact) => artifact.path))
+    if (unique.size !== normalized.length) throw new Error("Root boundary artifact paths must be unique")
+    const contractRoot = this.contractRunRoot()
+    for (const artifact of normalized) {
+      if (artifact.path !== contractRoot && !artifact.path.startsWith(`${contractRoot}/`)) {
+        throw new Error(`Root boundary artifact ${artifact.path} must be under ${contractRoot}`)
+      }
+    }
+
+    const indexDirectory = await mkdtemp(join(tmpdir(), "quackery-boundary-index-"))
+    const env = { ...process.env, GIT_INDEX_FILE: join(indexDirectory, "index") }
+    try {
+      await execute("git", ["read-tree", baseCommit], { cwd: this.repository, env })
+      for (let index = 0; index < normalized.length; index += 1) {
+        const artifact = normalized[index]
+        if (!artifact) continue
+        const source = join(indexDirectory, `artifact-${index}`)
+        await writeFile(source, artifact.content, "utf8")
+        const blob = (await execute("git", ["hash-object", "-w", source], { cwd: this.repository, env })).stdout.trim()
+        await execute(
+          "git",
+          ["update-index", "--add", "--cacheinfo", `100644,${blob},${artifact.path}`],
+          { cwd: this.repository, env },
+        )
+      }
+      const tree = (await execute("git", ["write-tree"], { cwd: this.repository, env })).stdout.trim()
+      return (await execute("git", [
+        "-c", "user.name=Quackery", "-c", "user.email=quackery@local",
+        "commit-tree", tree, "-p", baseCommit, "-m", "quackery(root): freeze abstract worlds",
+      ], { cwd: this.repository, env })).stdout.trim()
+    } finally {
+      await rm(indexDirectory, { recursive: true, force: true })
+    }
   }
 
   get(nodeId: string): WorktreeRecord {

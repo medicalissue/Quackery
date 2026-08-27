@@ -1,31 +1,24 @@
 import { expect, test } from "bun:test"
 import { execFile } from "node:child_process"
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
-import { join } from "node:path"
+import { access, mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { basename, join } from "node:path"
 import { tmpdir } from "node:os"
 import { promisify } from "node:util"
-import type { NodeContext } from "../src/model.js"
+import type { NodeContext, NodePlan, RootSplitDecision } from "../src/model.js"
 import type { ConfirmedIntent } from "../src/intent.js"
 import { git } from "../src/git.js"
 import { RunRegistry } from "../src/registry.js"
 
 const execFileAsync = promisify(execFile)
 
-test("fake OpenCode sessions fill two holes in parallel and return one root commit", async () => {
-  const repository = await mkdtemp(join(tmpdir(), "quackery-e2e-"))
-  await execFileAsync("git", ["init", "-q"], { cwd: repository })
-  await writeFile(join(repository, "README.md"), "fixture\n")
-  await execFileAsync("git", ["add", "README.md"], { cwd: repository })
-  await execFileAsync("git", [
-    "-c", "user.name=Test", "-c", "user.email=test@example.com",
-    "commit", "-q", "-m", "base",
-  ], { cwd: repository })
+test("root Pharmacist fans out only Nurses, which delegate atomic holes to parallel Surgeons", async () => {
+  const repository = await repositoryFixture("quackery-e2e-")
   const base = await git(repository, ["rev-parse", "HEAD"])
-
   let nextSession = 0
   const sessions = new Map<string, string>()
   const sessionParents = new Map<string, string | undefined>()
   const sessionAgents = new Map<string, string>()
+  const authorized = new Map<string, NodeContext>()
   const leafStarts: number[] = []
   const fakeClient = {
     session: {
@@ -37,81 +30,39 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
       },
       async prompt(input: any) {
         const directory = sessions.get(input.path.id)
-        if (!directory) throw new Error(`unknown fake session ${input.path.id}`)
+        const node = authorized.get(input.path.id)
+        if (!directory || !node?.plan) throw new Error(`unknown fake session ${input.path.id}`)
         sessionAgents.set(input.path.id, input.body.agent)
-        if (input.body.agent === "pharmacist") {
-          const node = authorized.get(input.path.id)
-          if (!node) throw new Error("pharmacist session was not authorized")
-          await mkdir(join(directory, node.boundaryRoot), { recursive: true })
-          await writeFile(join(directory, node.boundaryRoot, "worlds.wit"), `
-            package quackery:fixture@0.1.0;
-            interface a { value: func() -> string; }
-            interface b { value: func() -> string; }
-            interface feature { value: func() -> string; }
-            world a-surgeon { export a; }
-            world b-surgeon { import a; export b; }
-            world feature-surgeon { import a; import b; export feature; }
-          `)
-          await writeFile(join(directory, node.boundaryRoot, "behavior.md"), "# a\nWrite a.txt.\n\n# b\nWrite b.txt.\n")
-          await writeFile(join(directory, node.boundaryRoot, "a.stub.ts"), "export interface A { value(): string }\n")
-          const witPath = `${node.boundaryRoot}/worlds.wit`
-          const behaviorPath = `${node.boundaryRoot}/behavior.md`
-          const stubPath = `${node.boundaryRoot}/a.stub.ts`
+        if (input.body.agent === "nurse") {
           return jsonResponse({
-            kind: "split",
-            children: [
-              leafPlan("a", [], "a-surgeon", "a.txt", witPath, behaviorPath, stubPath),
-              {
-                ...leafPlan("b", ["a"], "b-surgeon", "b.txt", witPath, behaviorPath, stubPath),
-                kind: "scope",
-                estimatedRemainingDepth: 1,
-              },
-            ],
-            join: {
-              integration: {
-                ...leafPlan(
-                  "feature-join",
-                  ["a", "b"],
-                  "feature-surgeon",
-                  "index.txt",
-                  witPath,
-                  behaviorPath,
-                  stubPath,
-                ),
-                exports: ["feature"],
-              },
-              verify: ["test -f a.txt && test -f b.txt && test -f index.txt"],
+            kind: "leaf",
+            leaf: {
+              ...node.plan,
+              id: `${node.plan.id}-implementation`,
+              kind: "leaf",
+              estimatedRemainingDepth: 0,
             },
           })
         }
-
-        if (input.body.agent === "nurse") {
-          const inherited = authorized.get(input.path.id)?.plan
-          if (!inherited) throw new Error("nurse session has no inherited plan")
-          return jsonResponse({
-            kind: "leaf",
-            leaf: { ...inherited, kind: "leaf", estimatedRemainingDepth: 0 },
-          })
-        }
-
-        const plan = authorized.get(input.path.id)?.plan
-        const leaf = plan?.owns[0]?.path === "index.txt" ? "index" : plan?.id
-        if (leaf !== "a" && leaf !== "b" && leaf !== "index") throw new Error(`unknown leaf for ${input.path.id}`)
-        if (leaf !== "index") leafStarts.push(Date.now())
+        if (input.body.agent !== "surgeon") throw new Error(`unexpected runtime agent ${input.body.agent}`)
+        const path = node.plan.owns[0]?.path
+        if (!path) throw new Error(`missing owned path for ${node.id}`)
+        if (path === "a.txt" || path === "b.txt") leafStarts.push(Date.now())
         await Bun.sleep(100)
-        await writeFile(join(directory, `${leaf}.txt`), `${leaf} implemented\n`)
-        return jsonResponse({ kind: "implemented", summary: `${leaf} done` })
+        await writeFile(join(directory, path), `${basename(path, ".txt")} implemented\n`)
+        return jsonResponse({ kind: "implemented", summary: `${path} done` })
       },
     },
   }
 
-  const authorized = new Map<string, NodeContext>()
   const registry = new RunRegistry()
   const handle = await registry.start({
     directory: repository,
     sessionId: "parent-session",
     goal: "implement a and b",
-    intent: directIntent(repository, base),
+    intent: directIntent(repository, base, "parent-session", "implement a and b"),
+    rootDecision: rootDecision(),
+    artifacts: rootArtifacts(),
     client: fakeClient,
     authorizeSession: (id, node) => authorized.set(id, node),
     policy: { allowJustifiedImbalance: false },
@@ -121,8 +72,6 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
   expect(result.ok).toBe(true)
   if (!result.ok) return
   expect(leafStarts).toHaveLength(2)
-  // The direct Surgeon remains active while the sibling Nurse establishes its
-  // own boundary and launches the nested Surgeon.
   expect(Math.max(...leafStarts) - Math.min(...leafStarts)).toBeLessThan(80)
   expect(await readFile(join(repository, "README.md"), "utf8")).toBe("fixture\n")
   expect(await Bun.file(join(repository, "a.txt")).exists()).toBe(false)
@@ -131,28 +80,21 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
   expect(await git(repository, ["show", `${result.headCommit}:index.txt`])).toBe("index implemented")
   expect(await git(repository, ["ls-tree", "-r", "--name-only", result.headCommit])).not.toContain(".quack/contracts/")
   expect(await git(repository, ["rev-list", "--count", `${base}..${result.headCommit}`])).toBe("1")
-  expect(handle.graph.snapshot.status).toBe("verified")
+  expect(handle.graph.render()).toContain("nurse · implement a · verified")
   expect(handle.graph.render()).toContain("surgeon · implement a · verified")
-  expect(handle.graph.render()).toContain("nurse · implement b · verified")
-  expect(authorized.size).toBe(5)
-
-  const pharmacist = [...sessionAgents].find(([, agent]) => agent === "pharmacist")?.[0]
-  const nurse = [...sessionAgents].find(([, agent]) => agent === "nurse")?.[0]
-  const surgeons = [...sessionAgents].filter(([, agent]) => agent === "surgeon").map(([id]) => id)
-  expect(pharmacist).toBeDefined()
-  expect(nurse).toBeDefined()
-  expect(sessionParents.get(pharmacist!)).toBe("parent-session")
-  expect(sessionParents.get(nurse!)).toBe(pharmacist)
-  expect(surgeons.some((id) => sessionParents.get(id) === pharmacist)).toBe(true)
-  expect(surgeons.some((id) => sessionParents.get(id) === nurse)).toBe(true)
+  expect([...sessionAgents.values()]).not.toContain("pharmacist")
+  expect([...sessionAgents.values()].filter((agent) => agent === "nurse")).toHaveLength(3)
+  expect([...sessionAgents.values()].filter((agent) => agent === "surgeon")).toHaveLength(3)
+  for (const [session, agent] of sessionAgents) {
+    if (agent === "nurse") expect(sessionParents.get(session)).toBe("parent-session")
+  }
 
   const worktrees = handle.git.recordsSnapshot()
+  expect(worktrees).toHaveLength(7)
   const restarted = new RunRegistry()
   const recovered = await restarted.snapshot(repository, handle.id, "parent-session")
   expect(recovered.status).toBe("verified")
   expect(recovered.resultCommit).toBe(result.headCommit)
-  expect(recovered.worktrees).toHaveLength(4)
-
   const applied = await restarted.apply(repository, handle.id, "parent-session")
   expect(applied.status).toBe("applied")
   expect(applied.cleanup?.failures).toEqual([])
@@ -160,14 +102,132 @@ test("fake OpenCode sessions fill two holes in parallel and return one root comm
   expect(await readFile(join(repository, "b.txt"), "utf8")).toBe("b implemented\n")
   expect(await readFile(join(repository, "index.txt"), "utf8")).toBe("index implemented\n")
   expect(await git(repository, ["ls-files", ".quack/contracts"])).toBe("")
-  for (const worktree of worktrees) {
-    expect(access(worktree.path)).rejects.toThrow()
-  }
-  expect(await git(repository, ["branch", "--list", `quackery/${handle.id}/*`])).toBe("")
+  for (const worktree of worktrees) expect(access(worktree.path)).rejects.toThrow()
 })
 
-test("a direct root LEAF returns one product-only commit", async () => {
-  const repository = await mkdtemp(join(tmpdir(), "quackery-root-leaf-"))
+test("does not create a root checkout before the Nurse fan-out finishes", async () => {
+  const repository = await repositoryFixture("quackery-no-root-checkout-")
+  const base = await git(repository, ["rev-parse", "HEAD"])
+  let releaseNurse!: () => void
+  const nurseGate = new Promise<void>((resolve) => { releaseNurse = resolve })
+  let nurseStarted!: () => void
+  const started = new Promise<void>((resolve) => { nurseStarted = resolve })
+  let nextSession = 0
+  const sessions = new Map<string, string>()
+  const authorized = new Map<string, NodeContext>()
+  const agents: string[] = []
+  const registry = new RunRegistry()
+  const handle = await registry.start({
+    directory: repository,
+    sessionId: "single-parent",
+    goal: "implement feature",
+    intent: directIntent(repository, base, "single-parent", "implement feature"),
+    rootDecision: {
+      kind: "split",
+      children: [scopePlan("feature", [], "feature-world", "feature.txt")],
+      join: { verify: ["test -f feature.txt"] },
+    },
+    artifacts: [
+      {
+        path: "worlds.wit",
+        content: `package quackery:single@0.1.0;
+          interface feature { value: func() -> string; }
+          world feature-world { export feature; }
+        `,
+      },
+      { path: "behavior.md", content: "# feature\n" },
+      { path: "fixture.stub.ts", content: "export interface Feature { value(): string }\n" },
+    ],
+    client: {
+      session: {
+        async create(input: any) {
+          const id = `single-${nextSession++}`
+          sessions.set(id, input.query.directory)
+          return { data: { id } }
+        },
+        async prompt(input: any) {
+          const node = authorized.get(input.path.id)
+          const directory = sessions.get(input.path.id)
+          if (!node?.plan || !directory) throw new Error("unknown single session")
+          agents.push(input.body.agent)
+          if (input.body.agent === "nurse") {
+            nurseStarted()
+            await nurseGate
+            return jsonResponse({
+              kind: "leaf",
+              leaf: { ...node.plan, id: "feature-implementation", kind: "leaf", estimatedRemainingDepth: 0 },
+            })
+          }
+          await writeFile(join(directory, "feature.txt"), "implemented\n")
+          return jsonResponse({ kind: "implemented", summary: "done" })
+        },
+      },
+    },
+    authorizeSession: (id, node) => authorized.set(id, node),
+  })
+
+  await started
+  expect(handle.git.recordsSnapshot().map((record) => record.nodeId)).toEqual(["root/feature"])
+  releaseNurse()
+  const result = await handle.promise
+  expect(result.ok).toBe(true)
+  expect(agents).toEqual(["nurse", "surgeon"])
+})
+
+function rootDecision(): RootSplitDecision {
+  return {
+    kind: "split",
+    children: [
+      scopePlan("a", [], "a-world", "a.txt"),
+      scopePlan("b", ["a"], "b-world", "b.txt"),
+    ],
+    join: {
+      integration: {
+        ...scopePlan("feature-integration", ["a", "b"], "feature-world", "index.txt"),
+        exports: ["feature"],
+      },
+      verify: ["test -f a.txt && test -f b.txt && test -f index.txt"],
+    },
+  }
+}
+
+function scopePlan(id: string, imports: string[], world: string, file: string): NodePlan & { kind: "scope" } {
+  return {
+    id,
+    kind: "scope",
+    scope: `implement ${id}`,
+    exports: [id],
+    imports,
+    world: { witPath: "worlds.wit", world, behaviorPath: "behavior.md" },
+    reads: ["fixture.stub.ts"],
+    artifacts: ["fixture.stub.ts"],
+    owns: [{ path: file, mode: "exact" }],
+    verify: [`test -f ${file}`],
+    estimatedRemainingDepth: 1,
+    estimatedWork: 1,
+  }
+}
+
+function rootArtifacts() {
+  return [
+    {
+      path: "worlds.wit",
+      content: `package quackery:fixture@0.1.0;
+        interface a { value: func() -> string; }
+        interface b { value: func() -> string; }
+        interface feature { value: func() -> string; }
+        world a-world { export a; }
+        world b-world { import a; export b; }
+        world feature-world { import a; import b; export feature; }
+      `,
+    },
+    { path: "behavior.md", content: "# fixture\n" },
+    { path: "fixture.stub.ts", content: "export interface Fixture { value(): string }\n" },
+  ]
+}
+
+async function repositoryFixture(prefix: string): Promise<string> {
+  const repository = await mkdtemp(join(tmpdir(), prefix))
   await execFileAsync("git", ["init", "-q"], { cwd: repository })
   await writeFile(join(repository, "README.md"), "fixture\n")
   await execFileAsync("git", ["add", "README.md"], { cwd: repository })
@@ -175,107 +235,22 @@ test("a direct root LEAF returns one product-only commit", async () => {
     "-c", "user.name=Test", "-c", "user.email=test@example.com",
     "commit", "-q", "-m", "base",
   ], { cwd: repository })
-  const base = await git(repository, ["rev-parse", "HEAD"])
-  let nextSession = 0
-  const sessions = new Map<string, string>()
-  const authorized = new Map<string, NodeContext>()
-  const fakeClient = {
-    session: {
-      async create(input: any) {
-        const id = `leaf-session-${nextSession++}`
-        sessions.set(id, input.query.directory)
-        return { data: { id } }
-      },
-      async prompt(input: any) {
-        const directory = sessions.get(input.path.id)
-        const node = authorized.get(input.path.id)
-        if (!directory || !node) throw new Error("unknown fake root-leaf session")
-        if (input.body.agent === "pharmacist") {
-          await mkdir(join(directory, node.boundaryRoot), { recursive: true })
-          await writeFile(join(directory, node.boundaryRoot, "world.wit"), `
-            package quackery:fixture@0.1.0;
-            interface feature { value: func() -> string; }
-            world feature-world { export feature; }
-          `)
-          await writeFile(join(directory, node.boundaryRoot, "behavior.md"), "# feature\n")
-          return jsonResponse({
-            kind: "leaf",
-            leaf: leafPlan(
-              "feature",
-              [],
-              "feature-world",
-              "feature.txt",
-              `${node.boundaryRoot}/world.wit`,
-              `${node.boundaryRoot}/behavior.md`,
-              `${node.boundaryRoot}/behavior.md`,
-            ),
-          })
-        }
-        await writeFile(join(directory, "feature.txt"), "implemented\n")
-        return jsonResponse({ kind: "implemented", summary: "done" })
-      },
-    },
-  }
-  const registry = new RunRegistry()
-  const handle = await registry.start({
-    directory: repository,
-    sessionId: "root-leaf-parent",
-    goal: "implement feature",
-    intent: { ...directIntent(repository, base), sessionId: "root-leaf-parent", goal: "implement feature" },
-    client: fakeClient,
-    authorizeSession: (id, node) => authorized.set(id, node),
-  })
-  const result = await handle.promise
-  expect(result.ok).toBe(true)
-  if (!result.ok) return
-  expect(await git(repository, ["rev-list", "--count", `${base}..${result.headCommit}`])).toBe("1")
-  expect(await git(repository, ["show", `${result.headCommit}:feature.txt`])).toBe("implemented")
-  expect(await git(repository, ["ls-tree", "-r", "--name-only", result.headCommit])).not.toContain(".quack/contracts/")
-  expect(await Bun.file(join(repository, "feature.txt")).exists()).toBe(false)
-})
-
-function leafPlan(
-  id: string,
-  imports: string[],
-  world: string,
-  file: string,
-  witPath: string,
-  behaviorPath: string,
-  stubPath: string,
-) {
-  return {
-    id,
-    kind: "leaf",
-    scope: `implement ${id}`,
-    exports: [id],
-    imports,
-    world: {
-      witPath,
-      world,
-      behaviorPath,
-    },
-    reads: [stubPath],
-    artifacts: [stubPath],
-    owns: [{ path: file, mode: "exact" }],
-    verify: [`test -f ${file}`],
-    estimatedRemainingDepth: 0,
-    estimatedWork: 1,
-  }
+  return repository
 }
 
 function jsonResponse(value: unknown) {
   return { data: { parts: [{ type: "text", text: JSON.stringify(value) }] } }
 }
 
-function directIntent(repository: string, repositoryBase: string): ConfirmedIntent {
+function directIntent(repository: string, repositoryBase: string, sessionId: string, goal: string): ConfirmedIntent {
   return {
     revision: "intent-test",
     source: "pharmacist-direct",
     repository,
     repositoryBase,
-    sessionId: "parent-session",
+    sessionId,
     confirmedAt: 1,
-    goal: "implement a and b",
+    goal,
     observableOutcomes: [],
     inScope: [],
     outOfScope: [],

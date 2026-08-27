@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { nodePlanSchema, type NodePlan, type SplitDecision } from "../src/model.js"
+import { nodePlanSchema, rootSplitDecisionSchema, type NodePlan, type SplitDecision } from "../src/model.js"
 import {
   assertBalancedSplit,
   assertDisjointOwnership,
@@ -85,6 +85,20 @@ describe("split validation", () => {
       plan({ id: "b", exports: ["service"], imports: ["store"] }),
     ]
     expect(() => assertWorldWiring(parent, children)).not.toThrow()
+  })
+
+  test("allows one or more root Nurse scopes but rejects a root Surgeon leaf", () => {
+    const nurse = plan({ id: "area", kind: "scope", exports: ["area"] })
+    expect(rootSplitDecisionSchema.safeParse({
+      kind: "split",
+      children: [nurse],
+      join: { verify: [] },
+    }).success).toBe(true)
+    expect(rootSplitDecisionSchema.safeParse({
+      kind: "split",
+      children: [{ ...nurse, kind: "leaf" }],
+      join: { verify: [] },
+    }).success).toBe(false)
   })
 })
 

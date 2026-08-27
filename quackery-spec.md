@@ -1,6 +1,6 @@
 # Quackery Specification
 
-**Status:** Draft 0.8
+**Status:** Draft 0.9
 
 **Category:** Git-native recursive parallel implementation plugin for OpenCode
 
@@ -10,24 +10,24 @@
 
 ## 1. Definition
 
-Quackery는 OpenCode 안에서 동작하는 Git-native plugin이다. 하나의 coding agent가 전체 작업을 오래 계획하고 순차적으로 구현하는 대신, 작업을 실행 중에 재귀적으로 분해하고 먼저 원자화된 구현부터 즉시 병렬 실행한다.
+Quackery는 OpenCode 안에서 동작하는 Git-native plugin이다. 하나의 coding agent가 전체 작업을 오래 계획하고 순차적으로 구현하는 대신, 선택된 Pharmacist가 사용자의 현재 checkout에서 최상위 Nurse scope만 정의하고, Nurse들이 실행 중에 재귀적으로 분해하며 먼저 원자화된 구현부터 즉시 병렬 실행한다.
 
-사용자는 slash command를 호출하지 않는다. OpenCode에서 `Tab` 또는 `Shift+Tab`으로 **Psychiatrist** 또는 **Pharmacist** primary agent를 직접 선택한다. Psychiatrist는 사용자 의도를 명세하고, Pharmacist는 hidden Nurse와 Surgeon을 사용해 그 의도를 병렬 구현한다.
+사용자는 slash command를 호출하지 않는다. OpenCode에서 `Tab` 또는 `Shift+Tab`으로 **Psychiatrist** 또는 **Pharmacist** primary agent를 직접 선택한다. Psychiatrist는 사용자 의도를 명세하고, Pharmacist는 hidden Nurse scope만 시작하며 Nurse가 hidden Nurse와 Surgeon을 재귀 배치해 그 의도를 병렬 구현한다.
 
 각 graph node는 한 가지 질문에 답한다.
 
 ```text
 이 scope를 지금 구현할 수 있는가?
 
-YES → Pharmacist/Nurse가 LEAF contract를 고정하고 Surgeon이 구현한다.
-NO  → Pharmacist/Nurse가 독립적인 자식 scope와 그 사이 interface를 정의하고 동시에 실행한다.
+YES → Nurse가 LEAF contract를 고정하고 별도 Surgeon에게 구현을 맡긴다.
+NO  → Nurse가 독립적인 Nurse/Surgeon 자식과 그 사이 interface를 정의하고 동시에 실행한다.
 ```
 
-그래프는 실행 전에 완성되지 않는다. Node가 분해될 때마다 아래로 확장된다. 먼저 leaf가 된 branch는 다른 branch의 분해가 끝날 때까지 기다리지 않는다.
+그래프는 실행 전에 완성되지 않는다. Pharmacist는 root의 immediate Nurse children만 만들고, 각 Nurse node가 분해될 때마다 아래로 확장된다. 먼저 leaf가 된 branch는 다른 branch의 분해가 끝날 때까지 기다리지 않는다.
 
 각 sibling node는 동일한 parent boundary commit에서 갈라진 독립 Git worktree에서 실행된다. 공유 파일은 parent join이 소유하고, 같은 병렬 구간에서 하나의 tracked path에는 하나의 writer만 존재한다.
 
-> Quackery는 Psychiatrist가 의도를 고정하고, Pharmacist가 최상위 경계를 만들며, Nurse가 각 branch를 재귀 분해하고, Surgeon이 먼저 원자화된 leaf부터 독립 worktree에서 즉시 구현하는 OpenCode fork-join plugin이다.
+> Quackery는 Psychiatrist가 의도를 고정하고, Pharmacist가 최상위 Nurse 경계를 만들며, Nurse가 각 branch를 재귀 분해하고 별도 Surgeon에게 원자화된 leaf를 맡기는 OpenCode fork-join plugin이다.
 
 각 Surgeon은 자신을 제외한 나머지가 모두 구현되어 있다고 가정할 수 있는 **abstract-complete world**를 받는다. 이 world는 Surgeon이 구현할 하나의 exported interface와 이미 존재한다고 가정할 imported interface들로 구성된다. Surgeon은 dependency의 실제 구현을 기다리거나 조사하지 않고 자신의 implementation hole 하나만 채운다.
 
@@ -122,7 +122,18 @@ Psychiatrist와 Pharmacist는 서로를 감싼 facade가 아니다. Psychiatrist
 | Nurse | `subagent` | hidden | 0..N concurrent | 중간 node의 재귀 분해와 local join 설계 |
 | Surgeon | `subagent` | hidden | 1 per leaf | 소유 파일 구현, 검증과 result commit |
 
-Nurse와 Surgeon은 `@` autocomplete에서 숨기며 Pharmacist runtime만 호출할 수 있다. Psychiatrist는 Nurse나 Surgeon을 호출할 수 없고 product source를 수정할 권한도 없다.
+Nurse와 Surgeon은 `@` autocomplete에서 숨기며 Quackery runtime만 호출할 수 있다. Psychiatrist는 Nurse나 Surgeon을 호출할 수 없고 product source를 수정할 권한도 없다.
+
+모든 role system prompt는 같은 짧은 **Quackery software execution protocol** prelude로 시작한다. 이 prelude는 의료 명칭이 실제 임상 역할극이 아니라 software orchestration role name임을 밝히고, 네 역할의 책임과 허용된 edge를 함께 보여준다.
+
+```text
+User → Psychiatrist
+User → Pharmacist
+Pharmacist → Nurse
+Nurse → Nurse | Surgeon
+```
+
+그 뒤에 `YOUR ASSIGNED ROLE`과 해당 역할의 상세 계약을 둔다. 따라서 Nurse나 Surgeon은 전체 조직 안에서 자신이 받은 입력과 반환할 결정을 이해하지만, 이전 역할의 model에게 직접 연락하거나 다음 역할을 직접 spawn한다고 오해하지 않는다. Session 생성, fan-out, commit, verify, join과 apply는 deterministic runtime의 책임이다. 실행마다 달라지는 node plan은 system prompt를 반복하지 않고 별도 node payload로 전달한다.
 
 ### 5.2 Psychiatrist: selectable interview mode
 
@@ -173,25 +184,26 @@ READY   → Intent Contract를 제시하고 사용자 확인을 기다린다
 
 Pharmacist는 사용자-facing execution agent이자 유일한 root decomposer다. 선택되면 현재 repository와 session에 연결된 최신 confirmed Intent Contract를 우선 사용한다. Contract가 없다면 명확한 요청에 한해 최소 Intent Contract를 고정할 수 있지만, 결과를 바꿀 모호함이 남아 있으면 인터뷰를 흉내 내지 않고 `NEEDS_PSYCHIATRIST`를 반환한다.
 
-Pharmacist는 전체 descendant plan을 만들지 않고 다음만 정의한다.
+Pharmacist는 사용자가 선택한 현재 primary session 자체에서 전체 descendant plan을 만들지 않고 다음만 정의한다.
 
-1. 예상 remaining depth가 균형 잡힌 최상위 child scope
+1. 예상 remaining depth가 균형 잡힌 최상위 Nurse scope
 2. Immediate child가 export할 interface와 import할 WIT world
 3. Child subtree별 path ownership
 4. Root acceptance obligation과 join-owned files
-5. Root boundary commit
+5. Checkout 없이 생성할 synthetic root boundary commit의 artifact
 
-원자적인 요청이라 병렬화 이득이 없으면 하나의 LEAF를 Surgeon에게 직접 보낼 수 있다. 둘 이상의 child를 만든 경우에는 모두 즉시 실행한다. 이후의 중간 분해는 직접 수행하지 않고 Nurse에게 넘기며, leaf 구현은 Surgeon에게만 맡긴다.
+원자적인 요청이라도 하나의 Nurse scope로 넘긴다. Pharmacist는 Surgeon을 직접 호출하거나 root LEAF를 만들 수 없다. Root child와 root integration은 모두 `kind: scope`인 Nurse node이며, 이후의 원자성 판정과 Surgeon handoff는 Nurse만 수행한다.
 
-Pharmacist가 모든 descendant leaf와 contract를 직접 열거해서는 안 된다. 그렇게 하면 전체 분해가 Pharmacist의 직렬 critical path가 되어 기존 중앙 orchestrator와 동일해진다. Pharmacist는 root의 immediate children만 만들고 나머지 graph 성장은 병렬 Nurse들에게 넘긴다. Root children은 가능한 한 비슷한 예상 remaining decomposition depth와 critical-path work를 가져야 한다.
+Pharmacist가 모든 descendant leaf와 contract를 직접 열거해서는 안 된다. 그렇게 하면 전체 분해가 Pharmacist의 직렬 critical path가 되어 기존 중앙 orchestrator와 동일해진다. Pharmacist는 root의 immediate Nurse children만 만들고 나머지 graph 성장은 병렬 Nurse들에게 넘긴다. Root children은 가능한 한 비슷한 예상 remaining decomposition depth와 critical-path work를 가져야 한다. `quackery_start`는 별도 Pharmacist session을 다시 호출하지 않고 이 root decision을 deterministic runtime에 넘긴다.
 
 ### 5.4 Nurse: Pharmacist-internal recursive decomposer
 
-Nurse는 Pharmacist 또는 다른 Nurse가 만든 non-leaf node를 받는다. 자신의 immediate children만 정의하며 inherited Intent Contract, WIT world와 ownership을 변경할 수 없다. Split할 때는 한 branch에 descendant decomposition이 몰리지 않도록 immediate child별 예상 remaining depth와 work를 함께 추정하고 균형 잡힌 경계를 선택한다.
+Nurse는 Pharmacist 또는 다른 Nurse가 만든 scope node를 받는다. 자신의 immediate Nurse/Surgeon children만 정의하며 inherited Intent Contract, WIT world와 ownership을 변경할 수 없다. Split할 때는 한 branch에 descendant decomposition이 몰리지 않도록 immediate child별 예상 remaining depth와 work를 함께 추정하고 균형 잡힌 경계를 선택한다.
 
 ```text
-현재 scope가 원자적이다   → LEAF contract를 Surgeon에게 전달
-아직 크다                → immediate children, local WIT worlds와 ownership을 정의하고 SPLIT
+현재 scope가 원자적이다   → LEAF를 반환하고 runtime이 별도 Surgeon child 생성
+원자적인 delta가 있다     → leaf Surgeon child로 할당
+아직 크거나 애매한 delta  → scope Nurse child로 할당
 안전하게 나눌 수 없다    → REFUSE 또는 structured contract failure
 ```
 
@@ -201,7 +213,7 @@ Nurse의 재귀성은 graph 표현을 위한 장식이 아니다. 서로 다른 
 
 ### 5.5 Surgeon: Pharmacist-internal leaf implementer
 
-Surgeon은 하나의 LEAF contract와 전용 worktree를 받아 소유 파일만 구현한다. 다른 agent를 생성하거나 scope를 재설계할 수 없다. Scope가 실제로 원자적이지 않으면 억지로 구현하지 않고 `NEEDS_NURSE`를 반환한다.
+Surgeon은 반드시 Nurse가 만든 하나의 LEAF contract와 전용 worktree를 받아 소유 파일만 구현한다. Pharmacist가 Surgeon을 직접 호출할 수 없다. Surgeon은 다른 agent를 생성하거나 scope를 재설계할 수 없으며, scope가 실제로 원자적이지 않으면 억지로 구현하지 않고 정확한 unresolved delta와 함께 `NEEDS_NURSE`를 반환한다.
 
 ### 5.6 Mode transition and runtime
 
@@ -214,7 +226,7 @@ stateDiagram-v2
     IntentReady --> RootSplit: user selects Pharmacist
     [*] --> RootSplit: direct Pharmacist request with clear intent
     RootSplit --> Interview: NEEDS_PSYCHIATRIST
-    RootSplit --> RecursiveSplit: Pharmacist emits root boundary
+    RootSplit --> RecursiveSplit: Pharmacist emits Nurse-only root boundary
     RecursiveSplit --> RecursiveSplit: Nurses emit child boundaries
     RecursiveSplit --> Implementing: Nurse emits LEAF
     Implementing --> Joining: Surgeons return result commits
@@ -242,7 +254,7 @@ flowchart TD
 
     P1 --> A["Nurse · Scope A"]
     P1 --> B["Nurse · Scope B"]
-    P1 --> C["Surgeon · Leaf C"]
+    P1 --> C["Nurse · Scope C"]
 
     A --> A1["Surgeon · Leaf A1"]
     A --> A2["Surgeon · Leaf A2"]
@@ -250,6 +262,7 @@ flowchart TD
     B --> B1["Nurse · Scope B1"]
     B1 --> B11["Surgeon · Leaf B1.1"]
     B1 --> B12["Surgeon · Leaf B1.2"]
+    C --> C1["Surgeon · Leaf C1"]
 
     A1 --> JA["Nurse join A"]
     A2 --> JA
@@ -266,12 +279,12 @@ flowchart TD
 
 Pharmacist는 전체 구현 계획을 만들지 않는다. Root 책임은 다음으로 제한된다.
 
-1. 최상위 child scope 정의
+1. 최상위 Nurse scope 정의
 2. Immediate child별 WIT import/export world 정의
 3. Child별 acceptance obligation 정의
 4. Root join verification 정의
 
-Pharmacist가 자식을 반환하면 runtime은 모든 자식을 즉시 병렬 실행해야 한다. LEAF child는 Surgeon에게, 더 분해해야 하는 child는 Nurse에게 전달한다.
+Pharmacist가 root decision을 `quackery_start`로 넘기면 runtime은 모든 Nurse child를 즉시 병렬 실행해야 한다. Pharmacist decision에는 LEAF child가 존재할 수 없으며, 각 Nurse가 이후의 Nurse/Surgeon 경계를 결정한다.
 
 ### 6.2 Nurse recursive decomposition
 
@@ -316,13 +329,13 @@ Quackery는 모든 branch의 분해가 완료될 때까지 implementation을 막
 ```text
 t0  Pharmacist root 실행
 
-t1  Nurse A, Nurse B, Surgeon C 동시 실행
+t1  Nurse A, Nurse B, Nurse C 동시 실행
 
 t2  Nurse A가 A1과 A2 Surgeon 실행
     Nurse B는 B1과 B2로 추가 분해
-    Surgeon C는 이미 구현 중
+    Nurse C가 C1 Surgeon 실행
 
-t3  Surgeon A1, A2, C 구현 계속
+t3  Surgeon A1, A2, C1 구현 계속
     B1 Surgeon 구현 시작
     B2 Nurse 추가 분해
 ```
@@ -406,7 +419,7 @@ base commit과 node worktree
 acceptance obligation
 ```
 
-Pharmacist와 Nurse의 decomposition call은 세 결과 중 정확히 하나를 반환한다. Surgeon은 이 protocol의 decision maker가 아니라 LEAF consumer다.
+Pharmacist는 `quackery_start`에 Nurse-only root SPLIT을 전달한다. Nurse의 decomposition call은 LEAF, SPLIT, REFUSE 중 정확히 하나를 반환한다. Surgeon은 이 protocol의 decision maker가 아니라 Nurse가 만든 LEAF consumer다.
 
 ### 7.3 SPLIT
 
@@ -420,6 +433,7 @@ intent_revision: intent-03
 
 children:
   - id: arithmetic
+    kind: scope
     exports: [arithmetic]
     imports: []
     world: contracts/calculator.wit#arithmetic-surgeon
@@ -429,6 +443,7 @@ children:
       - src/calculator/arithmetic/
 
   - id: input-machine
+    kind: scope
     exports: [input-machine]
     imports: [arithmetic]
     world: contracts/calculator.wit#input-surgeon
@@ -438,6 +453,7 @@ children:
       - src/calculator/input/
 
   - id: calculator-view
+    kind: scope
     exports: [calculator-view]
     imports: [input-machine]
     world: contracts/calculator.wit#view-surgeon
@@ -476,10 +492,12 @@ SPLIT은 다음 조건을 만족해야 한다.
 - Parent obligation은 child 또는 join에 빠짐없이 할당되어야 한다.
 - 하나의 child만 생성해서는 안 된다. 이 경우 현재 node를 leaf로 유지한다.
 - 각 child는 예상 remaining depth와 work를 가져야 하며 sibling 사이의 불균형이 설정된 한계를 넘으면 repartition하거나 불가피한 이유를 기록해야 한다.
+- Pharmacist의 root SPLIT은 하나 이상의 `scope` child만 허용하고 root integration도 `scope`여야 한다.
+- Nurse SPLIT은 `scope` Nurse child와 `leaf` Surgeon child를 함께 만들 수 있다.
 
 ### 7.4 LEAF
 
-현재 scope가 하나의 Surgeon에게 전달 가능한 상태다.
+현재 Nurse scope가 하나의 Surgeon에게 전달 가능한 상태다. LEAF를 반환한 Nurse가 Surgeon으로 역할을 바꾸는 것이 아니라 runtime이 별도 Surgeon child를 생성한다.
 
 ```yaml
 kind: leaf
@@ -572,6 +590,17 @@ exports → Surgeon이 구현해야 하는 interface
 imports → 이미 완성되어 있다고 가정하는 dependency interfaces
 ```
 
+여기서 one hole은 one function, one method, one file 또는 한 줄짜리 procedural step을 뜻하지 않는다. **하나의 응집된 object/service responsibility**를 뜻하며, exported interface는 그 책임의 public protocol이다. 같은 invariant를 함께 유지하는 여러 operation은 하나의 interface에 속할 수 있다. 반대로 서로 다른 책임을 우연히 같은 파일에 구현한다는 이유로 하나의 interface에 묶지 않는다.
+
+Quackery가 살리는 OOP 감각은 class hierarchy가 아니라 다음 네 가지다.
+
+- **Encapsulation:** 내부 상태 표현, private helper와 algorithm을 boundary 뒤에 숨긴다.
+- **Cohesion:** 하나의 export는 하나의 명확한 책임과 invariant를 가진다.
+- **Dependency inversion:** sibling의 concrete class나 파일 대신 imported interface에 의존한다.
+- **Substitutability:** 실제 sibling 구현과 parent-provided stub/fake가 동일한 observable contract를 만족한다.
+
+WIT에는 boundary를 건너는 named type, record, variant, resource, callable operation, result와 error만 둔다. Local variable, 내부 field, loop, branch, algorithm step, private helper, concrete dependency class와 내부 call order는 두지 않는다. Identity 또는 lifecycle 자체가 외부 contract일 때만 WIT `resource`를 사용하며 내부 field는 opaque하게 유지한다.
+
 Surgeon은 import의 실제 source를 조사하거나 수정하거나 다시 구현해서는 안 된다. Import가 실제로 아직 구현 중이어도 Surgeon에게는 parent-provided stub 또는 fake로 완성된 것처럼 보인다.
 
 ```wit
@@ -621,6 +650,23 @@ Non-goals: formatting and input-state transitions.
 
 Natural-language contract는 architecture를 다시 결정하는 prose plan이 아니다. WIT surface 안에서 observable behavior, error condition, effect와 non-goal만 설명한다. 모호해서 싼 Surgeon이 새로운 architecture 결정을 내려야 한다면 LEAF가 아니며 Nurse에게 되돌린다.
 
+기본 형식은 다음과 같다.
+
+```text
+Responsibility
+Inputs
+Outputs
+Preconditions
+Postconditions
+Invariants
+Errors
+Effects
+Constraints
+Non-goals
+```
+
+이 항목들도 구현 recipe가 아니다. 외부 observer가 무엇을 신뢰할 수 있는지를 정의한다. 특정 algorithm, data structure, loop, branch, private method, 내부 변수나 비관찰 가능한 call order는 금지한다. 한편 순서 자체가 외부에 관찰되는 protocol이라면 precondition/postcondition 또는 invariant로 표현할 수 있다.
+
 ### 9.3 Boundary materialization
 
 Split을 만든 Pharmacist 또는 Nurse는 child를 spawn하기 전에 boundary commit에 다음을 고정한다.
@@ -632,7 +678,7 @@ Split을 만든 Pharmacist 또는 Nurse는 child를 spawn하기 전에 boundary 
 5. World와 repository symbol의 binding metadata
 6. Child ownership과 verification obligation
 
-Target-language projection과 stub은 parent-owned boundary artifact다. Surgeon은 이를 변경하지 않는다. 지원되는 target에서는 generator를 사용할 수 있고, 그렇지 않으면 decomposer가 최소 projection을 작성하고 repository type-check로 검증한다.
+Target-language projection과 stub은 parent-owned boundary artifact다. Surgeon은 이를 변경하지 않는다. Projection은 WIT의 type과 signature만 target language로 옮기며 implementation logic을 포함하지 않는다. Stub/fake는 imported interface를 compile/test할 수 있을 만큼만 대체하고 child export의 예정 구현을 미리 작성하지 않는다. 지원되는 target에서는 generator를 사용할 수 있고, 그렇지 않으면 decomposer가 최소 projection을 작성하고 repository type-check로 검증한다.
 
 ### 9.4 Revision and invalidation
 
@@ -701,17 +747,18 @@ Quackery v0.1은 Git repository에서만 실행한다.
 git repository 확인
 → invocation branch와 base commit 기록
 → working tree cleanliness 확인
-→ isolated root worktree와 run branch 생성
-→ Pharmacist root 실행
+→ 현재 checkout에서 Pharmacist root decision 고정
+→ checkout 없는 synthetic root boundary commit 생성
+→ immediate Nurse worktree fan-out
 ```
 
 기본 모드에서는 tracked file, staged change와 untracked file을 포함해 invocation worktree가 clean해야 한다. Dirty worktree를 자동 stash, reset 또는 임의 commit하지 않는다. 이후 명시적인 snapshot mode를 제공할 수 있지만 v0.1은 이유와 변경 목록을 보여주고 REFUSE한다.
 
-Quackery는 실행 중 사용자의 원래 checkout을 수정하지 않는다. 성공한 root result는 별도 run branch와 commit으로 남기고 사용자가 apply를 승인할 때 invocation branch에 적용한다. 원래 branch가 base에서 이동했거나 dirty해졌다면 자동 적용하지 않고 result commit을 보존한다.
+Quackery는 실행 중 사용자의 원래 checkout을 수정하지 않는다. Root Pharmacist는 현재 checkout을 read-only context로 사용하며 별도 root checkout이나 runtime Pharmacist session을 만들지 않는다. 성공한 root result는 commit으로 남기고 사용자가 apply를 승인할 때 invocation branch에 적용한다. 원래 branch가 base에서 이동했거나 dirty해졌다면 자동 적용하지 않고 result commit을 보존한다.
 
 ### 11.2 Worktree topology
 
-Split node는 WIT worlds, behavior contract, binding, stubs와 child manifest를 자신의 **boundary commit**으로 먼저 고정한다. 모든 immediate child는 이 commit에서 branch되며 각자 독립 worktree와 OpenCode session을 가진다.
+Split node는 WIT worlds, behavior contract, binding, stubs와 child manifest를 자신의 **boundary commit**으로 먼저 고정한다. 모든 immediate child는 이 commit에서 branch되며 각자 독립 worktree와 OpenCode session을 가진다. Root boundary는 현재 HEAD tree와 Pharmacist가 `quackery_start`에 전달한 artifact로 temporary Git index와 `commit-tree`를 사용해 checkout 없이 만든다. Nurse boundary는 해당 Nurse worktree에서 만든다.
 
 ```text
 parent base commit
@@ -759,7 +806,7 @@ join 전       commit, WIT world revision과 ownership 재검사
 
 Agent role의 shell access는 거부한다. Agent의 구현 변경은 path-audited edit/write tool만 통과하며, verification command는 agent 응답 뒤 runtime이 구현 commit을 먼저 고정한 다음 실행한다. Verification이 tracked 또는 non-ignored untracked file을 만들거나 바꾸면 node를 실패시키고 구현 commit만 recoverable commit으로 보존한다. Ignored build output과 runtime scratch는 patch ownership 대상이 아니며 result commit에 포함될 수 없다.
 
-Pharmacist와 Nurse decomposition session은 product ownership에 쓸 수 없다. 새 WIT, behavior contract, projection과 stub은 runtime이 node별로 예약한 `.quack/contracts/<run>/<node>/` 아래에만 작성한다. Visible Pharmacist의 일반 conversation session은 edit을 거부하며, runtime-authorized isolated session만 이 boundary namespace에 쓸 수 있다. Boundary commit에 namespace 밖 변경이 하나라도 포함되면 child를 spawn하지 않는다.
+Pharmacist와 Nurse decomposition session은 product ownership에 쓸 수 없다. Pharmacist는 현재 checkout에서 read-only로 분석하고 root artifact 내용을 structured tool argument로 넘기며, runtime이 이를 `.quack/contracts/<run>/<root>/`의 synthetic commit으로 materialize한다. Nurse가 만드는 새 WIT, behavior contract, projection과 stub은 runtime이 node별로 예약한 `.quack/contracts/<run>/<node>/` 아래에만 작성한다. Boundary commit에 namespace 밖 변경이 하나라도 포함되면 child를 spawn하지 않는다.
 
 ### 11.5 Recovery and cleanup
 
@@ -820,7 +867,7 @@ Join은 agent의 reasoning transcript를 읽지 않는다. 다음 artifact만 �
 
 Parent는 sibling result를 stable node order로 integration worktree에 적용한다. Semantic merge 판단은 하지 않으며 ownership invariant상 sibling content conflict가 없어야 한다. Conflict가 발생하면 곧바로 join failure이며 agent가 임의로 양쪽 코드를 섞지 않는다.
 
-Parent join이 소유한 wiring 또는 registry file에 product-code 변경이 필요하면 Nurse나 Pharmacist가 직접 구현하지 않는다. Child result를 합성한 뒤 join-owned world 하나를 Integration LEAF로 만들고 Surgeon이 그 구멍만 구현한다. 이는 실제 child artifact가 필요한 명시적 completion dependency이며 recursive parallel 구간이 닫힌 뒤에만 실행된다.
+Parent join이 소유한 wiring 또는 registry file에 product-code 변경이 필요하면 Nurse나 Pharmacist가 직접 구현하지 않는다. Nurse parent는 child result를 합성한 뒤 atomic Integration LEAF를 Surgeon에게 전달하거나, 아직 큰 integration delta를 Nurse scope로 재귀 분해한다. Root Pharmacist는 Integration Nurse scope만 만들 수 있고, 그 Nurse가 원자성을 판정한 뒤 Surgeon에게 전달한다. 이는 실제 child artifact가 필요한 명시적 completion dependency이며 recursive parallel 구간이 닫힌 뒤에만 실행된다.
 
 Root join은 invocation base에 대한 전체 product diff를 하나의 root result commit으로 정규화한다. Internal boundary와 retry commit은 run provenance에는 남지만 사용자에게 적용 대상으로 제시하는 공개 경계는 이 root result commit 하나다.
 
@@ -841,7 +888,7 @@ kind: needs-nurse
 reason: "상태 전이와 persistence가 현재 scope에서 과도하게 결합됨"
 ```
 
-Runtime은 Surgeon의 미완성 working-tree 변경을 recoverable Git stash로 보존한 뒤 같은 node를 Nurse에게 다시 전달한다. Sibling subtree는 취소하거나 재실행하지 않는다. 재분해 횟수는 `limits.maxNeedsNurseBounces`로 제한하며, 상한을 다시 넘으면 해당 subtree만 실패한다. Integration LEAF도 composed child commit에서 전용 worktree를 만든 일반 leaf이므로 같은 local Nurse 재분해 경로를 사용한다.
+Runtime은 Surgeon의 미완성 working-tree 변경을 recoverable Git stash로 보존한 뒤 같은 delta를 Nurse에게 다시 전달한다. Sibling subtree는 취소하거나 재실행하지 않는다. 재분해 횟수는 `limits.maxNeedsNurseBounces`로 제한하며, 상한을 다시 넘으면 해당 subtree만 실패한다. Integration Surgeon도 composed child commit에서 전용 worktree를 받은 일반 Surgeon이므로 같은 local Nurse 재분해 경로를 사용한다.
 
 ### Contract failure
 
@@ -957,7 +1004,7 @@ t4  각 Nurse local join
 
 UI Surgeon은 InputMachine 구현 완료를 기다리지 않는다. Pharmacist가 정의한 interface와 stub을 사용한다. Input State Surgeon 역시 Arithmetic 구현 완료를 기다리지 않는다.
 
-각 branch는 서로 다른 worktree에서 같은 root boundary commit을 상속한다. `src/calculator/index.ts` 같은 최종 wiring file은 어느 parallel child도 수정하지 않는다. Child 결과가 합성된 뒤 root join이 Integration LEAF를 만들고 Surgeon이 한 번만 작성한다.
+각 branch는 서로 다른 worktree에서 같은 synthetic root boundary commit을 상속한다. `src/calculator/index.ts` 같은 최종 wiring file은 어느 parallel child도 수정하지 않는다. Child 결과가 합성된 뒤 root join의 Integration Nurse가 이를 원자적 LEAF로 고정하고 Surgeon이 한 번만 작성한다.
 
 ## 15. User Experience
 
@@ -1027,7 +1074,7 @@ Quackery는 agent 수가 아니라 critical path를 줄이는 것을 목표로 �
 - Root join success rate
 - Verified code change per token
 
-작은 작업에서는 인터뷰와 분해 비용이 구현 비용보다 클 수 있다. 명확한 direct Pharmacist request는 최소 Intent Contract를 만들고 하나의 LEAF를 Surgeon에게 바로 전달할 수 있어야 한다.
+작은 작업에서는 인터뷰와 분해 비용이 구현 비용보다 클 수 있다. 명확한 direct Pharmacist request는 최소 Intent Contract를 만들고 하나의 Nurse scope로 즉시 넘길 수 있어야 하며, 그 Nurse가 별도 Surgeon에게 atomic LEAF를 전달한다.
 
 ## 17. Acceptance Criteria
 
@@ -1041,8 +1088,8 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 6. Pharmacist는 confirmed Intent Contract를 소비하거나 명확한 direct request에 최소 contract를 만든다.
 7. 모호한 direct request에서 Pharmacist는 deep interview를 대신하지 않고 `NEEDS_PSYCHIATRIST`를 반환한다.
 8. Git repository와 clean invocation worktree를 확인하고 base commit을 기록한다.
-9. 사용자 checkout을 건드리지 않고 isolated root worktree에서 실행한다.
-10. Pharmacist root 요청은 둘 이상의 child node로 분해되거나 하나의 Surgeon LEAF로 전달될 수 있다.
+9. Pharmacist는 사용자 checkout을 read-only root context로 사용하고 별도 root checkout이나 두 번째 Pharmacist session 없이 synthetic root boundary commit을 만든다.
+10. Pharmacist root 요청은 하나 이상의 Nurse scope로만 분해되며 Surgeon LEAF로 직접 전달될 수 없다.
 11. Non-leaf child는 Nurse가 immediate children만 재귀 분해한다.
 12. Child마다 별도 Git worktree와 OpenCode child session이 생성된다.
 13. Child node는 서로 기다리지 않고 병렬 실행된다.
@@ -1060,7 +1107,7 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 25. Pharmacist와 Nurse의 SPLIT은 child별 estimated remaining depth와 work를 기록하고 설정된 balance limit을 만족하거나 불가피한 이유를 남긴다.
 26. 각 Surgeon은 정확히 하나의 WIT export와 완성된 것으로 취급할 imports를 받는다.
 27. WIT world와 import stub은 child spawn 전에 같은 boundary commit에 고정된다.
-28. Join-owned product code는 child 합성 뒤 별도 Integration LEAF의 Surgeon이 구현한다.
+28. Join-owned product code는 Nurse parent에서는 Nurse가 만든 Integration LEAF의 Surgeon이 구현하고, root에서는 Integration Nurse를 거친 뒤 Surgeon이 구현한다.
 29. `.quack/config.jsonc`와 local override로 role quality ladder, balance, limit과 cache policy를 설정할 수 있다.
 30. `quality`와 `balanced` profile은 Psychiatrist를 frontier에 두고, Pharmacist/Nurse/Surgeon을 각각 의도된 품질·비용 계층에 배치한다.
 31. 같은 parent boundary의 같은 역할 sibling cohort만 stable cache prefix와 cache group을 공유한다.
@@ -1070,8 +1117,9 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 35. 최종 root result commit에는 현재 run의 `.quack/contracts/<run>/` artifact가 포함되지 않는다.
 36. Process restart 뒤 persisted graph를 조회하고 verified result를 적용할 수 있으며 in-flight run은 자동 재호출 없이 `interrupted`로 표시한다.
 37. Apply 성공 뒤 temporary worktree와 run branch를 정리하고 cleanup failure를 별도로 보고·재시도한다.
-38. Integration LEAF의 `NEEDS_NURSE`는 completed sibling을 재실행하지 않고 integration subtree만 재귀 분해한다.
+38. Integration Surgeon의 `NEEDS_NURSE`는 completed sibling을 재실행하지 않고 해당 integration delta만 Nurse에게 되돌려 재귀 분해한다.
 39. Agent는 shell을 직접 실행하지 않으며 runtime verification이 worktree를 변경하면 result를 거부한다.
+40. WIT export는 one-function leaf가 아니라 하나의 응집된 object/service responsibility를 나타내며 WIT, behavior contract, projection과 stub은 내부 변수, private helper, algorithm 또는 control flow를 implementation requirement로 노출하지 않는다.
 
 ## 18. Design Invariants
 
@@ -1093,7 +1141,11 @@ Pharmacist와 Nurse는 sibling subtree의 예상 remaining depth와 critical-pat
 
 ### One world, one hole
 
-각 Surgeon은 정확히 하나의 WIT export를 구현한다. 모든 WIT import는 이미 완성된 dependency로 취급하며 Surgeon은 그 실제 구현을 기다리거나 조사하지 않는다.
+각 Surgeon은 정확히 하나의 응집된 object/service responsibility를 나타내는 WIT export를 구현한다. 이는 one function이나 procedural step을 뜻하지 않는다. 모든 WIT import는 이미 완성된 abstract dependency로 취급하며 Surgeon은 그 실제 구현을 기다리거나 조사하지 않는다.
+
+### Contracts hide implementations
+
+WIT와 natural-language behavior contract는 input, output, error, externally observable constraint와 invariant를 고정한다. 내부 변수, state representation, private helper, concrete class, algorithm과 control flow는 Surgeon의 구현 자유이며 parent contract에 새어 나오지 않는다.
 
 ### Interfaces precede implementations
 
@@ -1109,7 +1161,7 @@ Surgeon은 구현하고 검증한다. 다른 worker를 관리하거나 전체 �
 
 ### Roles do not blur
 
-Pharmacist는 root만 분해하고, Nurse는 중간 node만 분해하며, Surgeon만 product code를 구현한다.
+Pharmacist는 root의 Nurse scope만 분해하고, Nurse는 Nurse/Surgeon immediate child를 만들며, Surgeon만 product code를 구현한다. Pharmacist에서 Surgeon으로 향하는 edge는 존재하지 않는다.
 
 ### Join recursively
 

@@ -101,7 +101,7 @@ test("aborts an OpenCode request at the configured prompt timeout", async () => 
   const node: NodeContext = {
     id: "root",
     depth: 0,
-    role: "pharmacist",
+    role: "nurse",
     scope: "timeout",
     worktree: "/tmp",
     baseCommit: "base",
@@ -125,7 +125,7 @@ test("aborts an OpenCode request at the configured prompt timeout", async () => 
   expect(adapter.decompose(node)).rejects.toThrow("OpenCode request timeout")
 })
 
-test("rejects a root boundary commit that also changes product code", async () => {
+test("rejects a Nurse boundary commit that also changes product code", async () => {
   const repository = await mkdtemp(join(tmpdir(), "quack-boundary-"))
   await execFileAsync("git", ["init", "-q"], { cwd: repository })
   await writeFile(join(repository, "README.md"), "base\n")
@@ -136,8 +136,8 @@ test("rejects a root boundary commit that also changes product code", async () =
   ], { cwd: repository })
   const manager = new GitWorkspaceManager(repository, `boundary-test-${randomUUID()}`)
   const base = await manager.initialize()
-  const record = await manager.create("root", base)
-  const boundaryRoot = manager.boundaryRoot("root")
+  const record = await manager.create("root/nurse", base)
+  const boundaryRoot = manager.boundaryRoot("root/nurse")
   await mkdir(join(record.path, boundaryRoot), { recursive: true })
   await writeFile(join(record.path, boundaryRoot, "world.wit"), `
     package quackery:test@0.1.0;
@@ -147,9 +147,10 @@ test("rejects a root boundary commit that also changes product code", async () =
   await writeFile(join(record.path, boundaryRoot, "behavior.md"), "# Feature\n")
   await writeFile(join(record.path, "product.ts"), "export const unsafe = true\n")
   const node: NodeContext = {
-    id: "root",
-    depth: 0,
-    role: "pharmacist",
+    id: "root/nurse",
+    parentId: "root",
+    depth: 1,
+    role: "nurse",
     scope: "feature",
     worktree: record.path,
     baseCommit: base,
