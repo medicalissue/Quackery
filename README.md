@@ -31,7 +31,7 @@ bun run verify
 
 ## OpenCode configuration
 
-During local development, point OpenCode at the built package. For published-package use, add the package name to `opencode.json`:
+For published-package use, add the package name to `opencode.json`:
 
 ```json
 {
@@ -39,7 +39,7 @@ During local development, point OpenCode at the built package. For published-pac
 }
 ```
 
-This checkout already includes `.opencode/plugins/quackery.ts` as a local development shim, so running OpenCode from the repository loads the source plugin directly.
+The repository intentionally does not include an auto-loaded `.opencode/plugins` shim, so running OpenCode from this checkout tests the configured npm package instead of silently loading source code. When developing the plugin itself, use an explicit temporary `file://` plugin entry.
 
 The plugin registers visible `psychiatrist` and `pharmacist` primary agents and hidden `nurse` and `surgeon` subagents. Pharmacist uses `quackery_doctor`, `quackery_start`, `quackery_status`, `quackery_wait`, and `quackery_apply`; users do not need a slash-command entrypoint. `quackery_doctor` checks every local prerequisite while reporting provider reachability and cache behavior as `UNKNOWN` until a live run measures them.
 
