@@ -32,7 +32,14 @@ const surgeonNode: NodeContext = {
     scope: "implement one leaf",
     exports: ["feature"],
     imports: ["store"],
-    world: { witPath: "world.wit", world: "feature", behaviorPath: "behavior.md" },
+    world: {
+      witPath: "world.wit",
+      world: "feature",
+      behaviorPath: "behavior.md",
+      projectionPath: "projection.ts",
+      bindingPath: "binding.json",
+      stubs: [],
+    },
     reads: [],
     owns: [{ path: "src/feature.ts", mode: "exact" }],
     verify: ["bun test"],
@@ -80,10 +87,14 @@ test("implementation roles encode the strict Pharmacist to Nurse to Surgeon tree
   expect(nursePrompt).toContain("Atomic does not mean one function or a tiny code fragment")
   expect(nursePrompt).toContain("Preconditions, Postconditions, Invariants")
   expect(nursePrompt).toContain("projections contain signatures/types only")
+  expect(nursePrompt).toContain("reuses exports, imports, world (all paths and stubs), artifacts, owns, and verify exactly")
+  expect(nursePrompt).toContain("run trusted-local inspection")
   expect(surgeonPrompt).toContain("one atomic LEAF only from a Nurse")
   expect(surgeonPrompt).toContain("single cohesive exported object/service responsibility")
   expect(surgeonPrompt).toContain("return needs-nurse")
   expect(surgeonPrompt).toContain("return contract-failure")
+  expect(surgeonPrompt).toContain("trusted-local build, type-check, test")
+  expect(surgeonPrompt).toContain("not final acceptance")
   expect(surgeonPrompt).toContain("Do not mistake decomposition pseudocode for a public contract")
 })
 
@@ -100,4 +111,5 @@ test("node prompts contain only the assigned node payload, not a duplicate role 
   expect(nursePayload).toContain("one encapsulated object/service responsibility")
   expect(nursePayload).toContain("It must not encode internal variables")
   expect(nursePayload).toContain("Responsibility, Inputs, Outputs, Preconditions, Postconditions, Invariants")
+  expect(nursePayload).toContain("If the inherited scope is atomic")
 })

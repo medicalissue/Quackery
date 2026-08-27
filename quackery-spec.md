@@ -1,6 +1,6 @@
 # Quackery Specification
 
-**Status:** Draft 0.9
+**Status:** Draft 0.10
 
 **Category:** Git-native recursive parallel implementation plugin for OpenCode
 
@@ -680,6 +680,8 @@ Split을 만든 Pharmacist 또는 Nurse는 child를 spawn하기 전에 boundary 
 
 Target-language projection과 stub은 parent-owned boundary artifact다. Surgeon은 이를 변경하지 않는다. Projection은 WIT의 type과 signature만 target language로 옮기며 implementation logic을 포함하지 않는다. Stub/fake는 imported interface를 compile/test할 수 있을 만큼만 대체하고 child export의 예정 구현을 미리 작성하지 않는다. 지원되는 target에서는 generator를 사용할 수 있고, 그렇지 않으면 decomposer가 최소 projection을 작성하고 repository type-check로 검증한다.
 
+각 node world reference는 `witPath`, `behaviorPath`, `projectionPath`, `bindingPath`와 import별 `{ interface, path }` stub을 명시한다. Binding은 version, world, exported interface/target symbol과 exact imported interface/target symbol을 담는 JSON이다. Runtime은 spawn 전에 WIT와 plan의 interface 집합이 일치하는지, behavior 필수 section이 비어 있지 않은지, binding symbol이 projection/stub에 실제로 존재하는지 확인한다. TypeScript projection/stub은 standalone compiler check도 통과해야 한다.
+
 ### 9.4 Revision and invalidation
 
 World revision은 WIT, behavior contract, binding과 stub을 포함하는 parent boundary commit으로 식별한다. 모든 child는 정확히 같은 boundary revision에서 시작한다. World가 변경되면 그 import 또는 export에 의존한 descendant 결과는 재사용하지 않는다.
@@ -804,13 +806,13 @@ node 종료 시  base..head changed-path 전체 검사
 join 전       commit, WIT world revision과 ownership 재검사
 ```
 
-Agent role의 shell access는 거부한다. Agent의 구현 변경은 path-audited edit/write tool만 통과하며, verification command는 agent 응답 뒤 runtime이 구현 commit을 먼저 고정한 다음 실행한다. Verification이 tracked 또는 non-ignored untracked file을 만들거나 바꾸면 node를 실패시키고 구현 commit만 recoverable commit으로 보존한다. Ignored build output과 runtime scratch는 patch ownership 대상이 아니며 result commit에 포함될 수 없다.
+Quackery의 execution threat model은 trusted-local repository와 model이다. Nurse와 Surgeon은 자신의 isolated worktree에서 inspection, generation, build, type-check와 test command를 feedback으로 실행할 수 있지만 Git mutation command는 거부한다. Edit/write tool은 실행 전에 path-audit하고, runtime은 agent 응답 뒤 전체 tracked diff를 다시 ownership-audit한다. Authoritative verification은 runtime이 구현 commit을 먼저 고정한 다음 독립적으로 실행한다. Verification이 tracked 또는 non-ignored untracked file을 만들거나 바꾸면 node를 실패시키고 구현 commit만 recoverable commit으로 보존한다. Ignored build output과 runtime scratch는 patch ownership 대상이 아니며 result commit에 포함될 수 없다. 이 경계는 adversarial sandbox가 아니므로 untrusted repository나 model execution은 non-goal이다.
 
 Pharmacist와 Nurse decomposition session은 product ownership에 쓸 수 없다. Pharmacist는 현재 checkout에서 read-only로 분석하고 root artifact 내용을 structured tool argument로 넘기며, runtime이 이를 `.quack/contracts/<run>/<root>/`의 synthetic commit으로 materialize한다. Nurse가 만드는 새 WIT, behavior contract, projection과 stub은 runtime이 node별로 예약한 `.quack/contracts/<run>/<node>/` 아래에만 작성한다. Boundary commit에 namespace 밖 변경이 하나라도 포함되면 child를 spawn하지 않는다.
 
 ### 11.5 Recovery and cleanup
 
-Quackery는 user branch에 force push, hard reset 또는 implicit stash를 수행하지 않는다. 실패한 subtree의 branch와 last commit은 run metadata에 기록한다. Graph snapshot은 atomic rename으로 저장하며 process restart 뒤 verified result의 status와 apply를 복구할 수 있다. Process와 함께 중단된 in-flight run은 자동으로 이어서 model session을 호출하지 않고 `interrupted`로 표시하며 branch와 worktree를 보존한다.
+Quackery는 user branch에 force push, hard reset 또는 implicit stash를 수행하지 않는다. 실패한 subtree의 branch와 last commit은 run metadata에 기록한다. Graph snapshot은 atomic rename으로 저장하며 process restart 뒤 verified result의 status와 apply를 복구할 수 있다. Running snapshot은 runtime lease와 heartbeat를 가지며 fresh lease가 있는 run은 다른 plugin instance가 cancel/cleanup할 수 없다. Stale lease 또는 lease 없는 in-flight run만 `interrupted`로 해석한다. Process와 함께 중단된 model session은 자동 재호출하지 않으며 branch와 worktree를 보존한다.
 
 성공한 result를 사용자가 적용한 뒤 임시 worktree와 run branch를 정리한다. Cleanup 실패는 구현 성공과 구분해 snapshot에 기록하고, 이미 적용된 run에 `quackery_apply`를 다시 호출하면 남은 cleanup만 재시도한다. 최종 result commit은 실행용 `.quack/contracts/<run>/`을 invocation base 상태로 되돌려 product diff만 포함한다.
 
@@ -888,7 +890,7 @@ kind: needs-nurse
 reason: "상태 전이와 persistence가 현재 scope에서 과도하게 결합됨"
 ```
 
-Runtime은 Surgeon의 미완성 working-tree 변경을 recoverable Git stash로 보존한 뒤 같은 delta를 Nurse에게 다시 전달한다. Sibling subtree는 취소하거나 재실행하지 않는다. 재분해 횟수는 `limits.maxNeedsNurseBounces`로 제한하며, 상한을 다시 넘으면 해당 subtree만 실패한다. Integration Surgeon도 composed child commit에서 전용 worktree를 받은 일반 Surgeon이므로 같은 local Nurse 재분해 경로를 사용한다.
+Runtime은 Surgeon의 미완성 working-tree 변경을 recoverable Git stash로 보존한다. 이전 retry가 이미 commit을 만들었다면 실패 branch tip도 보존하고 isolated checkout만 frozen boundary로 detach한다. 그 뒤 같은 delta를 Nurse에게 다시 전달하며 sibling subtree는 취소하거나 재실행하지 않는다. 재분해 횟수는 `limits.maxNeedsNurseBounces`로 제한하며, 상한을 다시 넘으면 해당 subtree만 실패한다. Integration Surgeon도 composed child commit에서 전용 worktree를 받은 일반 Surgeon이므로 같은 local Nurse 재분해 경로를 사용한다.
 
 ### Contract failure
 
@@ -902,11 +904,11 @@ evidence:
   - "session 생성은 last-login-at 갱신과 atomic해야 함"
 ```
 
-Parent가 WIT world나 behavior contract를 수정하면 해당 revision에 의존한 descendant만 무효화한다.
+Parent가 WIT world나 behavior contract를 수정하면 해당 revision에 의존한 descendant만 무효화한다. Failed attempt가 이미 product commit을 만들었다면 runtime은 그 commit을 recoverable branch tip으로 보존하고 isolated worker checkout만 frozen boundary로 detach한 뒤 Nurse repair를 시작한다.
 
 ### Join failure
 
-개별 child는 통과했지만 parent integration이 실패한 경우다. Parent는 관련 child만 repair하거나, WIT world를 수정하거나, 강하게 결합된 child를 하나의 node로 다시 합칠 수 있다.
+개별 child는 통과했지만 parent integration 또는 acceptance가 실패한 경우다. Frozen integration ownership이 있으면 runtime은 completed child result를 그대로 재사용하고 그 integration delta만 전용 Nurse repair subtree로 되돌린 뒤 root/local verification을 제한된 횟수로 다시 실행한다. Ownership이나 contract 자체를 바꿔야 하면 해당 parent boundary에서만 재분해한다.
 
 전체 graph의 무조건적인 재계획은 허용하지 않는다.
 
@@ -917,6 +919,8 @@ Parent가 WIT world나 behavior contract를 수정하면 해당 revision에 의�
 - 최대 graph depth
 - 최대 node 수
 - Leaf별 `NEEDS_NURSE` 재분해 횟수
+- Decomposition, leaf와 join별 attempt 수
+- 동시 provider request 수와 provider가 반환한 observed cost
 - OpenCode request별 timeout
 - Verification command별 timeout
 - 전체 run timeout과 abort signal
@@ -1024,7 +1028,7 @@ PHARMACIST
 > 구현해줘
 ```
 
-Quackery는 별도의 status panel, graph widget, 버튼 또는 다른 custom TUI surface를 만들지 않는다. 실행 관찰에는 OpenCode가 기본 제공하는 conversation transcript와 parent/child session navigation을 그대로 사용한다. Plugin-owned graph state는 계속 유지하며 Pharmacist는 의미 있는 phase transition, 사용자 요청과 완료 시점에 일반 assistant message로 compact text tree, node count, verification과 failure를 보고한다. 장문의 reasoning이나 agent 간 자유 형식 대화는 사용자에게 중계하지 않는다.
+Quackery는 별도의 status panel, graph widget, 버튼 또는 다른 custom TUI surface를 만들지 않는다. 실행 관찰에는 OpenCode가 기본 제공하는 conversation transcript와 parent/child session navigation을 그대로 사용한다. Plugin-owned graph state는 계속 유지하며 Pharmacist는 `quackery_status`, `quackery_wait`와 `quackery_evidence`로 compact text tree, node count, provider usage, 실행 command, verification과 failure를 보고한다. 장문의 reasoning이나 agent 간 자유 형식 대화는 사용자에게 중계하지 않는다.
 
 완료 응답에는 root result commit, 실행한 verification과 성공·실패·미검증 경계를 일반 text로 제시한다. 사용자가 conversation에서 apply를 승인하면 invocation branch가 안전한지 다시 확인한 뒤 result commit을 반영한다. 안전하지 않으면 branch와 commit을 보존하고 사용자가 직접 검토할 수 있는 명령을 보여준다.
 
@@ -1101,7 +1105,7 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 19. Nurse는 child result commit을 local join하고, Pharmacist는 root join을 수행한다.
 20. Pharmacist root join과 root acceptance가 통과해야 실행이 완료된다.
 21. 성공 결과는 recoverable Git commit으로 남고 사용자 승인 후 invocation branch에 적용된다.
-22. 실행은 설정된 depth, node, `NEEDS_NURSE`, request, verification과 whole-run time limit을 초과하지 않으며 provider token/cost hard cap은 지원 여부를 측정하기 전까지 명시적으로 `UNKNOWN`이다.
+22. 실행은 설정된 depth, node, `NEEDS_NURSE`, decomposition/leaf/join attempt, provider concurrency, observed cost, request, verification과 whole-run time limit을 초과하지 않으며 provider-side token/cost hard cap은 지원 여부를 측정하기 전까지 명시적으로 `UNKNOWN`이다.
 23. Intent와 graph 상태는 agent conversation context와 독립적으로 저장된다.
 24. 의미적 decomposition은 규칙 기반 deterministic compiler로 대체되지 않는다.
 25. Pharmacist와 Nurse의 SPLIT은 child별 estimated remaining depth와 work를 기록하고 설정된 balance limit을 만족하거나 불가피한 이유를 남긴다.
@@ -1115,11 +1119,12 @@ Quackery v0.1은 최소한 다음을 만족해야 한다.
 33. Text graph는 provider가 반환한 input/output/cache read/cache write/cost telemetry를 집계한다.
 34. Cache warm-up 때문에 Surgeon 또는 Nurse fan-out을 기다리게 하는 global barrier가 없다.
 35. 최종 root result commit에는 현재 run의 `.quack/contracts/<run>/` artifact가 포함되지 않는다.
-36. Process restart 뒤 persisted graph를 조회하고 verified result를 적용할 수 있으며 in-flight run은 자동 재호출 없이 `interrupted`로 표시한다.
+36. Process restart 뒤 persisted graph를 조회하고 verified result를 적용할 수 있다. Fresh runtime lease는 concurrent cancel/cleanup을 막고 stale in-flight run만 자동 model 재호출 없이 `interrupted`로 표시한다.
 37. Apply 성공 뒤 temporary worktree와 run branch를 정리하고 cleanup failure를 별도로 보고·재시도한다.
 38. Integration Surgeon의 `NEEDS_NURSE`는 completed sibling을 재실행하지 않고 해당 integration delta만 Nurse에게 되돌려 재귀 분해한다.
-39. Agent는 shell을 직접 실행하지 않으며 runtime verification이 worktree를 변경하면 result를 거부한다.
+39. Trusted-local Nurse와 Surgeon은 isolated worktree command를 feedback으로 사용할 수 있지만 Git state를 변경할 수 없고, runtime verification이 worktree를 변경하면 result를 거부한다.
 40. WIT export는 one-function leaf가 아니라 하나의 응집된 object/service responsibility를 나타내며 WIT, behavior contract, projection과 stub은 내부 변수, private helper, algorithm 또는 control flow를 implementation requirement로 노출하지 않는다.
+41. Self-host B1 report는 persisted graph와 Git facts에서 source 및 regression-test 변경, Nurse/Surgeon provider telemetry, 단일 normalized result commit, product-only diff, full verification과 package inspection evidence를 모두 확인해야 한다.
 
 ## 18. Design Invariants
 

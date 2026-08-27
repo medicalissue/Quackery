@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { boundaryCacheSeed, cacheContext, cachePartitionKey, usageFromResponse } from "../src/cache.js"
 import type { DecompositionDecision, NodeContext, NodePlan } from "../src/model.js"
-import { RunGraph } from "../src/graph.js"
+import { renderRunEvidence, RunGraph } from "../src/graph.js"
 
 function plan(id: string, kind: "scope" | "leaf", exported: string): NodePlan {
   return {
@@ -10,7 +10,14 @@ function plan(id: string, kind: "scope" | "leaf", exported: string): NodePlan {
     scope: `${id} scope`,
     exports: [exported],
     imports: ["shared-dependency"],
-    world: { witPath: "contracts/worlds.wit", world: `${id}-world`, behaviorPath: `contracts/${id}.md` },
+    world: {
+      witPath: "contracts/worlds.wit",
+      world: `${id}-world`,
+      behaviorPath: `contracts/${id}.md`,
+      projectionPath: "contracts/projection.ts",
+      bindingPath: `contracts/${id}.binding.json`,
+      stubs: [],
+    },
     reads: [],
     owns: [{ path: `src/${id}`, mode: "prefix" }],
     verify: ["bun test"],
@@ -97,7 +104,25 @@ test("text graph distinguishes cache eligibility from provider-returned usage", 
   expect(graph.render()).toContain("cache eligible")
   graph.transition(child.id, "verified", {
     usage: { input: 100, output: 20, reasoning: 0, cacheRead: 80, cacheWrite: 0, cost: 0.01 },
+    evidence: [{ command: "bun test", exitCode: 0, output: "1 pass" }],
   })
   expect(graph.render()).toContain("cache 80r/0w")
   expect(graph.render()).toContain("cache 80 read/0 write")
+  const evidence = renderRunEvidence(graph.snapshot, child.id)
+  expect(evidence).toContain("[0] bun test")
+  expect(evidence).toContain("1 pass")
+})
+
+test("command evidence identifies explicit and absent sources", () => {
+  const graph = new RunGraph({ id: "evidence-run", repository: "/tmp/repo", root: root(), invocationBase: "base" })
+  graph.transition("root", "verified", {
+    evidence: [
+      { command: "bun run verify", exitCode: 0, output: "verified", source: "runtime-leaf" },
+      { command: "bun test", exitCode: 1, output: "failed" },
+    ],
+  })
+
+  const evidence = renderRunEvidence(graph.snapshot)
+  expect(evidence).toContain("[0] bun run verify · source runtime-leaf\n")
+  expect(evidence).toContain("[1] bun test · source unknown\n")
 })

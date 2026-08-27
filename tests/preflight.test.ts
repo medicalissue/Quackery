@@ -23,7 +23,8 @@ test("preflight separates local readiness from live provider unknowns", async ()
   const routing = Object.fromEntries(roles.map((role) => [role, configuredRoleModel(config, role)])) as any
   const ready = await runPreflight(repository, config, routing)
   expect(ready.ready).toBe(true)
-  expect(ready.checks.find((check) => check.name === "provider reachability/cache")?.status).toBe("UNKNOWN")
+  expect(ready.checks.find((check) => check.name === "live provider protocol")?.status).toBe("UNKNOWN")
+  expect(ready.checks.find((check) => check.name === "provider cache")?.status).toBe("UNKNOWN")
 
   await writeFile(join(repository, "dirty.txt"), "dirty\n")
   const dirty = await runPreflight(repository, config, routing)

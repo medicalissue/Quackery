@@ -20,6 +20,11 @@
     "maxDepth": 6,
     "maxNodes": 32,
     "maxNeedsNurseBounces": 1,
+    "maxLeafAttempts": 2,
+    "maxDecompositionAttempts": 2,
+    "maxJoinAttempts": 2,
+    "maxConcurrency": 4,
+    "maxObservedCost": 0,
     "maxRunSeconds": 3600,
     "maxPromptSeconds": 600,
     "verificationSeconds": 120

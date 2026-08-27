@@ -6,6 +6,7 @@ import type {
   NodeResult,
   NodeSuccess,
   SplitDecision,
+  VerificationEvidence,
 } from "./model.js"
 import { RunGraph } from "./graph.js"
 import {
@@ -20,6 +21,11 @@ export interface RuntimeLimits {
   maxDepth: number
   maxNodes: number
   maxNeedsNurseBounces: number
+  maxLeafAttempts?: number
+  maxDecompositionAttempts?: number
+  maxJoinAttempts?: number
+  maxConcurrency?: number
+  maxObservedCost?: number
 }
 
 export interface RuntimePolicy extends BalancePolicy, RuntimeLimits {}
@@ -65,10 +71,13 @@ export function assertSplitContract(
 
 export interface ExecutionAdapter {
   decompose(node: NodeContext): Promise<DecompositionDecision>
+  reviseDecomposition?(node: NodeContext, error: Error, attempt: number): Promise<DecompositionDecision>
   commitBoundary(node: NodeContext, decision: DecompositionDecision): Promise<string>
   forkChild(parent: NodeContext, boundaryCommit: string, plan: NodePlan): Promise<NodeContext>
   runLeaf(node: NodeContext, boundaryCommit: string): Promise<NodeResult>
   prepareNeedsNurse(node: NodeContext): Promise<void | string>
+  prepareRetry?(node: NodeContext, failure: NodeResult, nextAttempt: number): Promise<void>
+  telemetry?(node: NodeContext): Pick<NodeResult, "usage" | "evidence">
   prepareJoin?(node: NodeContext, children: NodeSuccess[]): Promise<string>
   join(
     node: NodeContext,
@@ -113,47 +122,55 @@ export class RecursiveRuntime {
       return this.executeLeaf(node, node.baseCommit)
     }
 
-    this.graph.transition(node.id, "decomposing")
-
-    let decision: DecompositionDecision
-    try {
-      decision = await this.adapter.decompose(node)
-    } catch (error) {
-      return this.failed(node, "Decomposition failed", error)
-    }
-
-    if (decision.kind === "refuse") {
-      this.graph.transition(node.id, "refused", { failure: decision.reason })
-      return {
-        ok: false,
-        nodeId: node.id,
-        reason: decision.reason,
-        detail: decision.detail,
-        actualDepth: 0,
+    const maxAttempts = this.policy.maxDecompositionAttempts ?? 2
+    let decision: DecompositionDecision | undefined
+    let boundaryCommit: string | undefined
+    let correction: Error | undefined
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      node.attempt = attempt
+      this.graph.transition(node.id, "decomposing", { attempts: attempt })
+      try {
+        decision = correction && this.adapter.reviseDecomposition
+          ? await this.adapter.reviseDecomposition(node, correction, attempt)
+          : await this.adapter.decompose(node)
+        if (decision.kind === "refuse") {
+          const telemetry = this.adapter.telemetry?.(node)
+          this.graph.transition(node.id, "refused", {
+            failure: decision.reason,
+            attempts: attempt,
+            ...(telemetry?.usage ? { usage: telemetry.usage } : {}),
+            ...(telemetry?.evidence?.length ? { evidence: telemetry.evidence } : {}),
+          })
+          return {
+            ok: false,
+            nodeId: node.id,
+            reason: decision.reason,
+            detail: decision.detail,
+            actualDepth: 0,
+            ...(telemetry?.usage ? { usage: telemetry.usage } : {}),
+            ...(telemetry?.evidence?.length ? { evidence: telemetry.evidence } : {}),
+          }
+        }
+        if (decision.kind === "split") assertSplitContract(node.plan, decision, this.policy)
+        else this.validateLeaf(node, decision.leaf)
+        boundaryCommit = await this.adapter.commitBoundary(node, decision)
+        node.boundaryCommit = boundaryCommit
+        this.graph.transition(node.id, "boundary", { boundaryCommit, attempts: attempt })
+        break
+      } catch (error) {
+        correction = error instanceof Error ? error : new Error(String(error))
+        if (attempt === maxAttempts || !this.adapter.reviseDecomposition) {
+          return this.failed(node, decision ? "Boundary contract failed" : "Decomposition failed", correction)
+        }
       }
     }
-
-    try {
-      if (decision.kind === "split") assertSplitContract(node.plan, decision, this.policy)
-      else this.validateLeaf(node, decision.leaf)
-    } catch (error) {
-      return this.failed(node, "Invalid split contract", error)
-    }
-
-    let boundaryCommit: string
-    try {
-      boundaryCommit = await this.adapter.commitBoundary(node, decision)
-      node.boundaryCommit = boundaryCommit
-      this.graph.transition(node.id, "boundary", { boundaryCommit })
-    } catch (error) {
-      return this.failed(node, "Boundary commit failed", error)
-    }
+    if (!decision || !boundaryCommit) return this.failed(node, "Decomposition produced no boundary")
 
     if (decision.kind === "leaf") {
       return this.delegateLeaf(node, decision.leaf, boundaryCommit)
     }
-
-    return this.executeSplit(node, decision, boundaryCommit)
+    if (decision.kind === "split") return this.executeSplit(node, decision, boundaryCommit)
+    return this.failed(node, "Decomposition returned a refusal after boundary creation")
   }
 
   private async executeSplit(
@@ -204,7 +221,7 @@ export class RecursiveRuntime {
       }
       this.nodeCount += 1
       try {
-        integrationNode = await this.adapter.forkChild(node, joinBase, { ...integrationPlan, id: "integration" })
+        integrationNode = await this.adapter.forkChild(node, joinBase, integrationPlan)
       } catch (error) {
         return this.failed(node, "Integration worktree creation failed", error)
       }
@@ -216,25 +233,77 @@ export class RecursiveRuntime {
       }
       integrationResult = result
     }
-    try {
-      const result = await this.adapter.join(
-        node,
-        boundaryCommit,
-        childResults.filter((result): result is NodeSuccess => result.ok),
-        decision,
-        integrationResult,
-      )
-      const actualDepth = 1 + Math.max(
+    const successfulChildren = childResults.filter((result): result is NodeSuccess => result.ok)
+    const maxJoinAttempts = this.policy.maxJoinAttempts ?? 2
+    const priorEvidence: NonNullable<NodeResult["evidence"]> = []
+    let currentIntegration = integrationResult
+    let repairDepth = integrationResult?.actualDepth ?? 0
+    for (let attempt = 1; attempt <= maxJoinAttempts; attempt += 1) {
+      node.attempt = attempt
+      this.graph.transition(node.id, "joining", { attempts: attempt })
+      let result: NodeResult
+      try {
+        result = await this.adapter.join(node, boundaryCommit, successfulChildren, decision, currentIntegration)
+      } catch (error) {
+        return this.failed(node, "Recursive join failed", error)
+      }
+      result.evidence = [...new Map([
+        ...priorEvidence,
+        ...successfulChildren.flatMap((child) => child.evidence),
+        ...(currentIntegration?.evidence ?? []),
+        ...(result.evidence ?? []),
+      ].map((item) => [JSON.stringify(item), item])).values()]
+      priorEvidence.splice(0, priorEvidence.length, ...result.evidence)
+      result.actualDepth = 1 + Math.max(
         0,
-        ...childResults.map((result) => result.actualDepth),
-        integrationResult?.actualDepth ?? 0,
+        ...successfulChildren.map((child) => child.actualDepth),
+        repairDepth,
       )
-      result.actualDepth = actualDepth
-      this.recordResult(node, result)
-      return result
-    } catch (error) {
-      return this.failed(node, "Recursive join failed", error)
+      if (result.ok || result.reason !== "JOIN_VERIFICATION_FAILED" || !integrationPlan || attempt === maxJoinAttempts) {
+        this.recordResult(node, result)
+        return result
+      }
+      if (!result.recoverableCommit) {
+        return this.failed(node, "Join repair has no recoverable integration commit", undefined, priorEvidence)
+      }
+      if (this.nodeCount >= this.policy.maxNodes) {
+        return this.failed(node, `Maximum node count ${this.policy.maxNodes} exceeded before join repair`, undefined, priorEvidence)
+      }
+      this.nodeCount += 1
+      let repairId = `integration-repair-${attempt}`
+      let suffix = 1
+      while (this.graph.snapshot.nodes.some((candidate) => candidate.id === `${node.id}/${repairId}`)) {
+        repairId = `integration-repair-${attempt}-${suffix++}`
+      }
+      const repairPlan: NodePlan = {
+        ...integrationPlan,
+        id: repairId,
+        kind: "scope",
+        scope: `Repair ${node.scope} join acceptance without rerunning completed children`,
+        estimatedRemainingDepth: Math.max(1, integrationPlan.estimatedRemainingDepth),
+      }
+      let repairNode: NodeContext
+      try {
+        repairNode = await this.adapter.forkChild(node, result.recoverableCommit, repairPlan)
+      } catch (error) {
+        return this.failed(node, "Join repair worktree creation failed", error, priorEvidence)
+      }
+      delete repairNode.cache
+      repairNode.repair = { reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) }
+      this.graph.add(repairNode)
+      const repaired = await this.executeNode(repairNode)
+      if (!repaired.ok) {
+        return this.failed(
+          node,
+          `Join repair ${repairNode.id} failed: ${repaired.reason}`,
+          repaired.detail,
+          [...priorEvidence, ...(repaired.evidence ?? [])],
+        )
+      }
+      currentIntegration = repaired
+      repairDepth = Math.max(repairDepth, repaired.actualDepth)
     }
+    return this.failed(node, "Join repair exhausted without a result", undefined, priorEvidence)
   }
 
   private async delegateLeaf(node: NodeContext, plan: NodePlan, boundaryCommit: string): Promise<NodeResult> {
@@ -270,16 +339,60 @@ export class RecursiveRuntime {
     boundaryCommit: string,
     patch: Partial<GraphNodeState> = {},
   ): Promise<NodeResult> {
-    this.graph.transition(node.id, "implementing", {
-      ...patch,
-    })
-    let result: NodeResult
-    try {
-      result = await this.adapter.runLeaf(node, boundaryCommit)
-    } catch (error) {
-      return this.failed(node, "Surgeon execution failed", error)
+    const maxAttempts = this.policy.maxLeafAttempts ?? 2
+    let result: NodeResult | undefined
+    const attemptEvidence: VerificationEvidence[] = []
+    const seenEvidence = new Set<string>()
+    let recoverableCommit: string | undefined
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      node.attempt = attempt
+      this.graph.transition(node.id, "implementing", {
+        ...patch,
+        attempts: attempt,
+        ...(node.modelOverride
+          ? { model: `${node.modelOverride.providerID}/${node.modelOverride.modelID}${node.modelOverride.variant ? `#${node.modelOverride.variant}` : ""}` }
+          : {}),
+      })
+      try {
+        result = await this.adapter.runLeaf(node, boundaryCommit)
+      } catch (error) {
+        const telemetry = this.adapter.telemetry?.(node)
+        result = {
+          ok: false,
+          nodeId: node.id,
+          reason: "SURGEON_EXECUTION_FAILED",
+          detail: error instanceof Error ? error.message : String(error),
+          actualDepth: 0,
+          ...(telemetry?.usage ? { usage: telemetry.usage } : {}),
+          ...(telemetry?.evidence?.length ? { evidence: telemetry.evidence } : {}),
+        }
+      }
+      for (const evidence of result.evidence ?? []) {
+        const key = JSON.stringify(evidence)
+        if (!seenEvidence.has(key)) {
+          seenEvidence.add(key)
+          attemptEvidence.push(evidence)
+        }
+      }
+      recoverableCommit = result.ok ? recoverableCommit : result.recoverableCommit ?? recoverableCommit
+      if (result.ok) break
+      const retryable = ["SURGEON_EXECUTION_FAILED", "VERIFICATION_FAILED"].includes(result.reason)
+      if (!retryable || attempt === maxAttempts) break
+      node.repair = {
+        reason: result.reason,
+        ...(result.detail ? { detail: result.detail } : {}),
+        ...(result.evidence?.length ? { evidence: result.evidence } : {}),
+      }
+      try {
+        await this.adapter.prepareRetry?.(node, result, attempt + 1)
+      } catch (error) {
+        return this.failed(node, "Failed to prepare Surgeon retry", error)
+      }
     }
-    if (!result.ok && result.reason === "NEEDS_NURSE") {
+    if (!result) return this.failed(node, "Surgeon produced no result")
+    result.evidence = attemptEvidence
+    if (!result.ok && recoverableCommit && !result.recoverableCommit) result.recoverableCommit = recoverableCommit
+    if (!result.ok && (result.reason === "NEEDS_NURSE" || result.reason === "CONTRACT_FAILURE")) {
       const bounces = this.needsNurseBounces.get(node.id) ?? 0
       if (bounces < this.policy.maxNeedsNurseBounces) {
         try {
@@ -291,6 +404,13 @@ export class RecursiveRuntime {
           return this.failed(node, "Failed to preserve Surgeon attempt before Nurse bounce", error)
         }
         this.needsNurseBounces.set(node.id, bounces + 1)
+        node.repair = {
+          reason: result.reason,
+          ...(result.detail ? { detail: result.detail } : {}),
+          ...(result.evidence?.length ? { evidence: result.evidence } : {}),
+        }
+        node.priorEvidence = [...(node.priorEvidence ?? []), ...(result.evidence ?? [])]
+        delete node.cache
         node.role = "nurse"
         this.graph.transition(node.id, "decomposing", { role: "nurse" })
         return this.executeNode(node, true)
@@ -305,8 +425,9 @@ export class RecursiveRuntime {
     if (
       leaf.exports[0] !== node.plan.exports[0]
       || JSON.stringify([...leaf.imports].sort()) !== JSON.stringify([...node.plan.imports].sort())
-      || leaf.world.witPath !== node.plan.world.witPath
-      || leaf.world.world !== node.plan.world.world
+      || JSON.stringify(leaf.world) !== JSON.stringify(node.plan.world)
+      || JSON.stringify([...(leaf.artifacts ?? [])].sort()) !== JSON.stringify([...(node.plan.artifacts ?? [])].sort())
+      || JSON.stringify(leaf.verify) !== JSON.stringify(node.plan.verify)
     ) {
       throw new Error(`Leaf ${leaf.id} changes its inherited abstract world`)
     }
@@ -314,29 +435,47 @@ export class RecursiveRuntime {
   }
 
   private recordResult(node: NodeContext, result: NodeResult): void {
+    const evidence = [...(node.priorEvidence ?? []), ...(result.evidence ?? [])]
+    result.evidence = evidence
     if (result.ok) {
       this.graph.transition(node.id, "verified", {
         headCommit: result.headCommit,
+        attempts: node.attempt ?? 1,
+        actualDepth: result.actualDepth,
+        changedPaths: result.changedPaths,
+        evidence,
         ...(result.usage ? { usage: result.usage } : {}),
       })
     } else {
       this.graph.transition(node.id, "failed", {
         failure: result.reason,
+        attempts: node.attempt ?? 1,
+        actualDepth: result.actualDepth,
+        ...(result.evidence ? { evidence: result.evidence } : {}),
         ...(result.recoverableCommit ? { recoverableCommit: result.recoverableCommit } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
       })
     }
   }
 
-  private failed(node: NodeContext, reason: string, error?: unknown): NodeResult {
+  private failed(node: NodeContext, reason: string, error?: unknown, evidence: VerificationEvidence[] = []): NodeResult {
     const detail = error instanceof Error ? error.message : error === undefined ? undefined : String(error)
-    this.graph.transition(node.id, "failed", { failure: detail ? `${reason}: ${detail}` : reason })
+    const telemetry = this.adapter.telemetry?.(node)
+    const combinedEvidence = [...evidence, ...(telemetry?.evidence ?? [])]
+    this.graph.transition(node.id, "failed", {
+      failure: detail ? `${reason}: ${detail}` : reason,
+      attempts: node.attempt ?? 1,
+      ...(telemetry?.usage ? { usage: telemetry.usage } : {}),
+      ...(combinedEvidence.length ? { evidence: combinedEvidence } : {}),
+    })
     return {
       ok: false,
       nodeId: node.id,
       reason,
       ...(detail ? { detail } : {}),
       actualDepth: 0,
+      ...(telemetry?.usage ? { usage: telemetry.usage } : {}),
+      ...(combinedEvidence.length ? { evidence: combinedEvidence } : {}),
     }
   }
 }

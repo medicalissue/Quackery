@@ -4,7 +4,7 @@ import { resolve } from "node:path"
 import { z } from "zod"
 import { git, repositoryRoot } from "./git.js"
 
-export const intentFieldsSchema = z.object({
+const persistedIntentFieldsSchema = z.object({
   goal: z.string().min(1),
   observableOutcomes: z.array(z.string().min(1)).default([]),
   inScope: z.array(z.string().min(1)).default([]),
@@ -14,9 +14,15 @@ export const intentFieldsSchema = z.object({
   assumptions: z.array(z.string().min(1)).default([]),
 }).strict()
 
+export const intentFieldsSchema = persistedIntentFieldsSchema.extend({
+  observableOutcomes: z.array(z.string().min(1)).min(1),
+  acceptance: z.array(z.string().min(1)).min(1),
+})
+
 export type IntentFields = z.infer<typeof intentFieldsSchema>
 
-export const confirmedIntentSchema = intentFieldsSchema.extend({
+// Existing persisted v0.1 intents may predate the non-empty outcome/acceptance gate.
+export const confirmedIntentSchema = persistedIntentFieldsSchema.extend({
   revision: z.string().min(1),
   source: z.enum(["psychiatrist", "pharmacist-direct"]),
   repository: z.string().min(1),

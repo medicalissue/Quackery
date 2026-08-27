@@ -12,6 +12,12 @@ export const worldRefSchema = z.object({
   witPath: z.string().min(1),
   world: z.string().min(1),
   behaviorPath: z.string().min(1),
+  projectionPath: z.string().min(1),
+  bindingPath: z.string().min(1),
+  stubs: z.array(z.object({
+    interface: z.string().min(1),
+    path: z.string().min(1),
+  }).strict()).default([]),
 })
 
 export type WorldRef = z.infer<typeof worldRefSchema>
@@ -42,7 +48,7 @@ export type JoinPlan = z.infer<typeof joinPlanSchema>
 
 export const leafDecisionSchema = z.object({
   kind: z.literal("leaf"),
-  leaf: nodePlanSchema,
+  leaf: nodePlanSchema.extend({ kind: z.literal("leaf") }),
 })
 
 export const splitDecisionSchema = z.object({
@@ -76,7 +82,7 @@ export const rootSplitDecisionSchema = z.object({
   children: z.array(rootNursePlanSchema).min(1),
   join: z.object({
     integration: rootNursePlanSchema.optional(),
-    verify: z.array(z.string().min(1)).default([]),
+    verify: z.array(z.string().min(1)).min(1),
   }),
   imbalanceJustification: z.string().min(1).optional(),
 })
@@ -111,6 +117,7 @@ export interface TokenUsage {
 
 export interface NodeContext {
   id: string
+  runId?: string
   parentId?: string
   depth: number
   role: NodeRole
@@ -122,6 +129,18 @@ export interface NodeContext {
   boundaryRoot: string
   cache?: CacheContext
   intent?: ConfirmedIntent
+  attempt?: number
+  repair?: {
+    reason: string
+    detail?: string
+    evidence?: VerificationEvidence[]
+  }
+  priorEvidence?: VerificationEvidence[]
+  modelOverride?: {
+    providerID: string
+    modelID: string
+    variant?: string
+  }
 }
 
 export type NodeStatus =
@@ -133,11 +152,13 @@ export type NodeStatus =
   | "verified"
   | "failed"
   | "refused"
+  | "canceled"
 
 export interface VerificationEvidence {
   command: string
   exitCode: number
   output: string
+  source?: "worker-feedback" | "runtime-leaf" | "runtime-join"
 }
 
 export interface NodeSuccess {
@@ -159,6 +180,7 @@ export interface NodeFailure {
   recoverableCommit?: string
   actualDepth: number
   usage?: TokenUsage
+  evidence?: VerificationEvidence[]
 }
 
 export type NodeResult = NodeSuccess | NodeFailure
@@ -179,6 +201,11 @@ export interface GraphNodeState {
   recoverableCommit?: string
   cacheGroup?: string
   usage?: TokenUsage
+  attempts?: number
+  actualDepth?: number
+  changedPaths?: string[]
+  evidence?: VerificationEvidence[]
+  model?: string
   startedAt?: number
   completedAt?: number
 }
@@ -192,12 +219,17 @@ export interface RunSnapshot {
   resultCommit?: string
   appliedCommit?: string
   worktrees?: Array<{ nodeId: string; path: string; branch: string }>
+  lease?: {
+    id: string
+    processId: number
+    heartbeatAt: number
+  }
   cleanup?: {
     removedWorktrees: string[]
     removedBranches: string[]
     failures: string[]
   }
-  status: "running" | "verified" | "failed" | "interrupted" | "applied"
+  status: "running" | "verified" | "failed" | "interrupted" | "canceled" | "abandoned" | "applied"
   nodes: GraphNodeState[]
   createdAt: number
   updatedAt: number

@@ -45,6 +45,11 @@ export const quackConfigSchema = z.object({
     maxDepth: z.number().int().min(1).max(12).default(6),
     maxNodes: z.number().int().min(1).max(128).default(32),
     maxNeedsNurseBounces: z.number().int().min(0).max(3).default(1),
+    maxLeafAttempts: z.number().int().min(1).max(5).default(2),
+    maxDecompositionAttempts: z.number().int().min(1).max(5).default(2),
+    maxJoinAttempts: z.number().int().min(1).max(5).default(2),
+    maxConcurrency: z.number().int().min(1).max(32).default(4),
+    maxObservedCost: z.number().min(0).default(0),
     maxRunSeconds: z.number().int().min(1).max(86_400).default(3_600),
     maxPromptSeconds: z.number().int().min(1).max(3_600).default(600),
     verificationSeconds: z.number().int().min(1).max(1_800).default(120),
@@ -52,6 +57,11 @@ export const quackConfigSchema = z.object({
     maxDepth: 6,
     maxNodes: 32,
     maxNeedsNurseBounces: 1,
+    maxLeafAttempts: 2,
+    maxDecompositionAttempts: 2,
+    maxJoinAttempts: 2,
+    maxConcurrency: 4,
+    maxObservedCost: 0,
     maxRunSeconds: 3_600,
     maxPromptSeconds: 600,
     verificationSeconds: 120,
@@ -153,4 +163,23 @@ export function configuredRoleModel(config: QuackConfig, role: ModelRole): Resol
     ...(target?.variant ? { variant: target.variant } : {}),
     source: target ? "quack" : "inherit",
   }
+}
+
+export function escalationRoleModel(config: QuackConfig, role: "nurse" | "surgeon"): ResolvedRoleModel | undefined {
+  const tiers: ModelTier[] = ["economy", "balanced", "strong", "frontier"]
+  const currentIndex = tiers.indexOf(roleTier(config, role))
+  for (let index = currentIndex + 1; index < tiers.length; index += 1) {
+    const tier = tiers[index]
+    if (!tier) continue
+    const target = config.models[tier]
+    if (!target) continue
+    return {
+      role,
+      tier,
+      model: target.model,
+      ...(target.variant ? { variant: target.variant } : {}),
+      source: "quack",
+    }
+  }
+  return undefined
 }

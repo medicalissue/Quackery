@@ -208,6 +208,13 @@ export class GitWorkspaceManager {
     return git(worktree, ["rev-parse", "stash@{0}"])
   }
 
+  async detachAt(nodeId: string, commit: string): Promise<void> {
+    const worktree = this.get(nodeId).path
+    const status = await git(worktree, ["status", "--porcelain=v1", "--untracked-files=all"])
+    if (status) throw new Error(`Cannot detach dirty node ${nodeId}`)
+    await git(worktree, ["checkout", "--detach", commit])
+  }
+
   async worktreeChanges(nodeId: string): Promise<string[]> {
     const worktree = this.get(nodeId).path
     const status = await git(worktree, ["status", "--porcelain=v1", "--untracked-files=all"])
@@ -227,18 +234,23 @@ export class GitWorkspaceManager {
     return paths
   }
 
-  async verify(nodeId: string, commands: string[], timeout = 120_000): Promise<VerificationEvidence[]> {
+  async verify(
+    nodeId: string,
+    commands: string[],
+    timeout = 120_000,
+    source: VerificationEvidence["source"] = "runtime-leaf",
+  ): Promise<VerificationEvidence[]> {
     const worktree = this.get(nodeId).path
     const evidence: VerificationEvidence[] = []
     for (const command of commands) {
       try {
         const result = await execute("/bin/sh", ["-lc", command], { cwd: worktree, timeout })
-        evidence.push({ command, exitCode: 0, output: `${result.stdout}${result.stderr}`.trim().slice(-20_000) })
+        evidence.push({ command, exitCode: 0, output: `${result.stdout}${result.stderr}`.trim().slice(-20_000), source })
       } catch (error) {
         if (error instanceof CommandError) {
-          evidence.push({ command, exitCode: error.exitCode, output: error.output.slice(-20_000) })
+          evidence.push({ command, exitCode: error.exitCode, output: error.output.slice(-20_000), source })
         } else {
-          evidence.push({ command, exitCode: 1, output: String(error).slice(-20_000) })
+          evidence.push({ command, exitCode: 1, output: String(error).slice(-20_000), source })
         }
         break
       }

@@ -63,7 +63,7 @@ export async function runPreflight(
   checks.push({
     name: "Quackery policy",
     status: "PASS",
-    detail: `profile ${config.profile}; depth ${config.limits.maxDepth}; nodes ${config.limits.maxNodes}; run ${config.limits.maxRunSeconds}s; prompt ${config.limits.maxPromptSeconds}s`,
+    detail: `profile ${config.profile}; depth ${config.limits.maxDepth}; nodes ${config.limits.maxNodes}; concurrency ${config.limits.maxConcurrency}; observed cost ${config.limits.maxObservedCost || "unbounded"}; run ${config.limits.maxRunSeconds}s; prompt ${config.limits.maxPromptSeconds}s`,
   })
   for (const role of roles) {
     const target = routing[role]
@@ -76,16 +76,24 @@ export async function runPreflight(
     })
   }
   checks.push({
-    name: "provider reachability/cache",
+    name: "live provider protocol",
     status: "UNKNOWN",
-    detail: "requires the live measurement run",
+    detail: "run quackery_doctor with live=true to measure",
+  })
+  checks.push({
+    name: "provider cache",
+    status: "UNKNOWN",
+    detail: "requires a live same-boundary fan-out run",
   })
   return { ready: !checks.some((check) => check.status === "FAIL"), checks }
 }
 
 export function renderPreflight(report: PreflightReport): string {
+  const livePassed = report.checks.some((check) => check.name === "live provider protocol" && check.status === "PASS")
   return [
-    report.ready ? "READY (provider execution not measured)" : "NOT READY",
+    report.ready
+      ? livePassed ? "READY (live provider protocol passed; cache not measured)" : "READY (provider execution not measured)"
+      : "NOT READY",
     "",
     ...report.checks.map((check) => `${check.status.padEnd(7)} ${check.name} · ${check.detail}`),
   ].join("\n")

@@ -5,11 +5,14 @@ import { join } from "node:path"
 import { nodePlanSchema, rootSplitDecisionSchema, type NodePlan, type SplitDecision } from "../src/model.js"
 import {
   assertBalancedSplit,
+  assertBoundaryAssets,
   assertDisjointOwnership,
   assertNodeWorldMatchesWit,
   assertWorldWiring,
   ContractValidationError,
 } from "../src/validation.js"
+
+const behaviorContract = `# Responsibility\nFeature responsibility.\n# Inputs\nDefined by WIT.\n# Outputs\nDefined by WIT.\n# Preconditions\nNone.\n# Postconditions\nThe result follows the contract.\n# Invariants\nThe interface remains stable.\n# Errors\nDefined by WIT.\n# Effects\nNone.\n# Constraints\nNo contract changes.\n# Non-goals\nImplementation details.\n`
 
 function plan(input: Partial<NodePlan> & Pick<NodePlan, "id" | "exports">): NodePlan {
   return {
@@ -22,6 +25,9 @@ function plan(input: Partial<NodePlan> & Pick<NodePlan, "id" | "exports">): Node
       witPath: "contracts/worlds.wit",
       world: `${input.id}-surgeon`,
       behaviorPath: "contracts/behavior.md",
+      projectionPath: "contracts/projection.ts",
+      bindingPath: "contracts/binding.json",
+      stubs: (input.imports ?? []).map((item) => ({ interface: item, path: `contracts/${item}.stub.ts` })),
     },
     reads: input.reads ?? [],
     owns: input.owns ?? [{ path: `src/${input.id}`, mode: "prefix" }],
@@ -92,11 +98,16 @@ describe("split validation", () => {
     expect(rootSplitDecisionSchema.safeParse({
       kind: "split",
       children: [nurse],
-      join: { verify: [] },
+      join: { verify: ["true"] },
     }).success).toBe(true)
     expect(rootSplitDecisionSchema.safeParse({
       kind: "split",
       children: [{ ...nurse, kind: "leaf" }],
+      join: { verify: ["true"] },
+    }).success).toBe(false)
+    expect(rootSplitDecisionSchema.safeParse({
+      kind: "split",
+      children: [nurse],
       join: { verify: [] },
     }).success).toBe(false)
   })
@@ -114,7 +125,15 @@ test("matches a node plan to one-export WIT world", async () => {
       export service;
     }
   `)
-  await writeFile(join(directory, "contracts/behavior.md"), "# service\n\nReturn the stored value.\n")
+  await writeFile(join(directory, "contracts/behavior.md"), behaviorContract)
+  await writeFile(join(directory, "contracts/projection.ts"), "export interface Service { run(): string }\n")
+  await writeFile(join(directory, "contracts/store.stub.ts"), "export const store = { get: (_key: string) => \"\" }\n")
+  await writeFile(join(directory, "contracts/binding.json"), JSON.stringify({
+    version: 1,
+    world: "service-surgeon",
+    export: { interface: "service", symbol: "Service" },
+    imports: [{ interface: "store", symbol: "store" }],
+  }))
   await expect(assertNodeWorldMatchesWit(directory, plan({
     id: "service",
     exports: ["service"],
@@ -123,6 +142,9 @@ test("matches a node plan to one-export WIT world", async () => {
       witPath: "contracts/worlds.wit",
       world: "service-surgeon",
       behaviorPath: "contracts/behavior.md",
+      projectionPath: "contracts/projection.ts",
+      bindingPath: "contracts/binding.json",
+      stubs: [{ interface: "store", path: "contracts/store.stub.ts" }],
     },
   }))).resolves.toBeUndefined()
 })
@@ -142,6 +164,53 @@ test("rejects syntactically invalid WIT through the canonical parser", async () 
       witPath: "contracts/worlds.wit",
       world: "service-surgeon",
       behaviorPath: "contracts/behavior.md",
+      projectionPath: "contracts/projection.ts",
+      bindingPath: "contracts/binding.json",
+      stubs: [],
     },
   }))).rejects.toMatchObject({ code: "invalid-wit" })
+})
+
+test("rejects incomplete behavior, import stubs, and binding metadata", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "quackery-incomplete-world-"))
+  await mkdir(join(directory, "contracts"))
+  await writeFile(join(directory, "contracts/projection.ts"), "export interface Service { run(): string }\n")
+  const service = plan({ id: "service", exports: ["service"], imports: ["store"] })
+  await expect(assertBoundaryAssets(directory, { ...service, world: { ...service.world, stubs: [] } }))
+    .rejects.toMatchObject({ code: "incomplete-world" })
+
+  await writeFile(join(directory, "contracts/store.stub.ts"), "export const store = {}\n")
+  await writeFile(join(directory, "contracts/projection.ts"), "export interface Service { run(: string }\n")
+  await expect(assertBoundaryAssets(directory, service)).rejects.toMatchObject({ code: "invalid-projection" })
+  await writeFile(join(directory, "contracts/projection.ts"), "export interface Service { run(): string }\n")
+  await writeFile(join(directory, "contracts/binding.json"), JSON.stringify({
+    version: 1,
+    world: "wrong-world",
+    export: { interface: "service", symbol: "Service" },
+    imports: [{ interface: "store", symbol: "store" }],
+  }))
+  await expect(assertBoundaryAssets(directory, service)).rejects.toMatchObject({ code: "invalid-binding" })
+  await writeFile(join(directory, "contracts/binding.json"), JSON.stringify({
+    version: 1,
+    world: "service-surgeon",
+    export: { interface: "service", symbol: "Service" },
+    imports: [{ interface: "store", symbol: "store" }],
+  }))
+  await writeFile(join(directory, "contracts/projection.ts"), "// Service is intentionally not declared.\nexport {}\n")
+  await expect(assertBoundaryAssets(directory, service)).rejects.toMatchObject({ code: "invalid-binding" })
+  await writeFile(join(directory, "contracts/projection.ts"), "export interface Service { run(): string }\n")
+
+  await writeFile(join(directory, "contracts/worlds.wit"), `
+    package quackery:test@0.1.0;
+    interface store { get: func() -> string; }
+    interface service { run: func() -> string; }
+    world service-surgeon { import store; export service; }
+  `)
+  await writeFile(join(directory, "contracts/behavior.md"), "# Responsibility\nOnly one section.\n")
+  await expect(assertNodeWorldMatchesWit(directory, service)).rejects.toMatchObject({ code: "incomplete-behavior" })
+  await writeFile(
+    join(directory, "contracts/behavior.md"),
+    behaviorContract.replace("# Errors\nDefined by WIT.\n", "# Errors\n"),
+  )
+  await expect(assertNodeWorldMatchesWit(directory, service)).rejects.toMatchObject({ code: "incomplete-behavior" })
 })

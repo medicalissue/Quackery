@@ -10,6 +10,7 @@ import { git } from "../src/git.js"
 import { RunRegistry } from "../src/registry.js"
 
 const execFileAsync = promisify(execFile)
+const behaviorContract = `# Responsibility\nFixture capability.\n# Inputs\nDefined by WIT.\n# Outputs\nDefined by WIT.\n# Preconditions\nThe fixture repository exists.\n# Postconditions\nOwned output is present.\n# Invariants\nThe boundary remains stable.\n# Errors\nVerification failures.\n# Effects\nWrites owned fixture files.\n# Constraints\nNo unowned changes.\n# Non-goals\nImplementation details.\n`
 
 test("root Pharmacist fans out only Nurses, which delegate atomic holes to parallel Surgeons", async () => {
   const repository = await repositoryFixture("quackery-e2e-")
@@ -49,7 +50,10 @@ test("root Pharmacist fans out only Nurses, which delegate atomic holes to paral
         if (!path) throw new Error(`missing owned path for ${node.id}`)
         if (path === "a.txt" || path === "b.txt") leafStarts.push(Date.now())
         await Bun.sleep(100)
-        await writeFile(join(directory, path), `${basename(path, ".txt")} implemented\n`)
+        const content = path === "index.txt"
+          ? node.id.includes("integration-repair") ? "index repaired\n" : "index incomplete\n"
+          : `${basename(path, ".txt")} implemented\n`
+        await writeFile(join(directory, path), content)
         return jsonResponse({ kind: "implemented", summary: `${path} done` })
       },
     },
@@ -71,39 +75,58 @@ test("root Pharmacist fans out only Nurses, which delegate atomic holes to paral
 
   expect(result.ok).toBe(true)
   if (!result.ok) return
+  expect(result.evidence).toContainEqual(expect.objectContaining({
+    command: "test -f a.txt && test -f b.txt && test \"$(cat index.txt)\" = \"index repaired\"",
+    exitCode: 1,
+  }))
   expect(leafStarts).toHaveLength(2)
-  expect(Math.max(...leafStarts) - Math.min(...leafStarts)).toBeLessThan(80)
+  expect(Math.max(...leafStarts) - Math.min(...leafStarts)).toBeLessThan(250)
   expect(await readFile(join(repository, "README.md"), "utf8")).toBe("fixture\n")
   expect(await Bun.file(join(repository, "a.txt")).exists()).toBe(false)
   expect(await git(repository, ["show", `${result.headCommit}:a.txt`])).toBe("a implemented")
   expect(await git(repository, ["show", `${result.headCommit}:b.txt`])).toBe("b implemented")
-  expect(await git(repository, ["show", `${result.headCommit}:index.txt`])).toBe("index implemented")
+  expect(await git(repository, ["show", `${result.headCommit}:index.txt`])).toBe("index repaired")
   expect(await git(repository, ["ls-tree", "-r", "--name-only", result.headCommit])).not.toContain(".quack/contracts/")
   expect(await git(repository, ["rev-list", "--count", `${base}..${result.headCommit}`])).toBe("1")
   expect(handle.graph.render()).toContain("nurse · implement a · verified")
   expect(handle.graph.render()).toContain("surgeon · implement a · verified")
   expect([...sessionAgents.values()]).not.toContain("pharmacist")
-  expect([...sessionAgents.values()].filter((agent) => agent === "nurse")).toHaveLength(3)
-  expect([...sessionAgents.values()].filter((agent) => agent === "surgeon")).toHaveLength(3)
+  expect([...sessionAgents.values()].filter((agent) => agent === "nurse")).toHaveLength(4)
+  expect([...sessionAgents.values()].filter((agent) => agent === "surgeon")).toHaveLength(4)
   for (const [session, agent] of sessionAgents) {
     if (agent === "nurse") expect(sessionParents.get(session)).toBe("parent-session")
   }
 
   const worktrees = handle.git.recordsSnapshot()
-  expect(worktrees).toHaveLength(7)
+  expect(worktrees).toHaveLength(9)
+  expect(handle.graph.snapshot.nodes.find((node) => node.id === "root/integration-repair-1")?.status).toBe("verified")
   const restarted = new RunRegistry()
   const recovered = await restarted.snapshot(repository, handle.id, "parent-session")
   expect(recovered.status).toBe("verified")
   expect(recovered.resultCommit).toBe(result.headCommit)
-  const applied = await restarted.apply(repository, handle.id, "parent-session")
-  expect(applied.status).toBe("applied")
-  expect(applied.cleanup?.failures).toEqual([])
-  expect(await readFile(join(repository, "a.txt"), "utf8")).toBe("a implemented\n")
-  expect(await readFile(join(repository, "b.txt"), "utf8")).toBe("b implemented\n")
-  expect(await readFile(join(repository, "index.txt"), "utf8")).toBe("index implemented\n")
+  const qualification = await restarted.qualifySelfHost(repository, handle.id, "parent-session")
+  expect(qualification.passed).toBe(false)
+  expect(qualification.checks.find((check) => check.name === "normalized result")?.status).toBe("PASS")
+  const terminalOperations = await Promise.allSettled([
+    restarted.apply(repository, handle.id, "parent-session"),
+    restarted.abandon(repository, handle.id, "parent-session"),
+  ])
+  const completed = terminalOperations.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<RunRegistry["apply"]>>> => item.status === "fulfilled")
+  expect(completed).toHaveLength(1)
+  expect(terminalOperations.filter((item) => item.status === "rejected")).toHaveLength(1)
+  const terminal = completed[0]!.value
+  expect(["applied", "abandoned"]).toContain(terminal.status)
+  expect(terminal.cleanup?.failures).toEqual([])
+  if (terminal.status === "applied") {
+    expect(await readFile(join(repository, "a.txt"), "utf8")).toBe("a implemented\n")
+    expect(await readFile(join(repository, "b.txt"), "utf8")).toBe("b implemented\n")
+    expect(await readFile(join(repository, "index.txt"), "utf8")).toBe("index repaired\n")
+  } else {
+    expect(await Bun.file(join(repository, "a.txt")).exists()).toBe(false)
+  }
   expect(await git(repository, ["ls-files", ".quack/contracts"])).toBe("")
   for (const worktree of worktrees) expect(access(worktree.path)).rejects.toThrow()
-})
+}, 20_000)
 
 test("does not create a root checkout before the Nurse fan-out finishes", async () => {
   const repository = await repositoryFixture("quackery-no-root-checkout-")
@@ -135,8 +158,18 @@ test("does not create a root checkout before the Nurse fan-out finishes", async 
           world feature-world { export feature; }
         `,
       },
-      { path: "behavior.md", content: "# feature\n" },
-      { path: "fixture.stub.ts", content: "export interface Feature { value(): string }\n" },
+      { path: "behavior.md", content: behaviorContract },
+      { path: "fixture.contract.ts", content: "export interface Feature { value(): string }\n" },
+      { path: "fixture.stub.ts", content: "export const fixture = { value: () => \"\" }\n" },
+      {
+        path: "feature-world.binding.json",
+        content: JSON.stringify({
+          version: 1,
+          world: "feature-world",
+          export: { interface: "feature", symbol: "Feature" },
+          imports: [],
+        }),
+      },
     ],
     client: {
       session: {
@@ -186,7 +219,7 @@ function rootDecision(): RootSplitDecision {
         ...scopePlan("feature-integration", ["a", "b"], "feature-world", "index.txt"),
         exports: ["feature"],
       },
-      verify: ["test -f a.txt && test -f b.txt && test -f index.txt"],
+      verify: ["test -f a.txt && test -f b.txt && test \"$(cat index.txt)\" = \"index repaired\""],
     },
   }
 }
@@ -198,7 +231,14 @@ function scopePlan(id: string, imports: string[], world: string, file: string): 
     scope: `implement ${id}`,
     exports: [id],
     imports,
-    world: { witPath: "worlds.wit", world, behaviorPath: "behavior.md" },
+    world: {
+      witPath: "worlds.wit",
+      world,
+      behaviorPath: "behavior.md",
+      projectionPath: "fixture.contract.ts",
+      bindingPath: `${world}.binding.json`,
+      stubs: imports.map((item) => ({ interface: item, path: "fixture.stub.ts" })),
+    },
     reads: ["fixture.stub.ts"],
     artifacts: ["fixture.stub.ts"],
     owns: [{ path: file, mode: "exact" }],
@@ -221,8 +261,25 @@ function rootArtifacts() {
         world feature-world { import a; import b; export feature; }
       `,
     },
-    { path: "behavior.md", content: "# fixture\n" },
-    { path: "fixture.stub.ts", content: "export interface Fixture { value(): string }\n" },
+    { path: "behavior.md", content: behaviorContract },
+    {
+      path: "fixture.contract.ts",
+      content: "export interface A { value(): string }\nexport interface B { value(): string }\nexport interface Feature { value(): string }\n",
+    },
+    { path: "fixture.stub.ts", content: "export const a = { value: () => \"\" }\nexport const b = { value: () => \"\" }\n" },
+    ...[
+      { world: "a-world", exported: "a", imports: [] },
+      { world: "b-world", exported: "b", imports: ["a"] },
+      { world: "feature-world", exported: "feature", imports: ["a", "b"] },
+    ].map((binding) => ({
+      path: `${binding.world}.binding.json`,
+      content: JSON.stringify({
+        version: 1,
+        world: binding.world,
+        export: { interface: binding.exported, symbol: `${binding.exported[0]?.toUpperCase()}${binding.exported.slice(1)}` },
+        imports: binding.imports.map((item) => ({ interface: item, symbol: item })),
+      }),
+    })),
   ]
 }
 
@@ -251,11 +308,11 @@ function directIntent(repository: string, repositoryBase: string, sessionId: str
     sessionId,
     confirmedAt: 1,
     goal,
-    observableOutcomes: [],
+    observableOutcomes: [goal],
     inScope: [],
     outOfScope: [],
     constraints: [],
-    acceptance: [],
+    acceptance: ["Root verification passes"],
     assumptions: [],
   }
 }

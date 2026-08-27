@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises"
-import { isAbsolute, posix, resolve } from "node:path"
+import { isAbsolute, posix, relative, resolve } from "node:path"
 import { types as generateWitTypes } from "@bytecodealliance/jco"
+import * as ts from "typescript"
 import type { NodePlan, OwnershipRule, SplitDecision } from "./model.js"
 
 export interface BalancePolicy {
@@ -173,6 +174,190 @@ export interface WitWorldShape {
   worlds: Map<string, { imports: string[]; exports: string[] }>
 }
 
+const behaviorHeadings = [
+  "Responsibility",
+  "Inputs",
+  "Outputs",
+  "Preconditions",
+  "Postconditions",
+  "Invariants",
+  "Errors",
+  "Effects",
+  "Constraints",
+  "Non-goals",
+] as const
+
+export async function assertBehaviorContract(worktree: string, plan: NodePlan): Promise<void> {
+  const path = resolveRepositoryPath(worktree, plan.world.behaviorPath)
+  let source: string
+  try {
+    source = await readFile(path, "utf8")
+  } catch (error) {
+    throw new ContractValidationError(
+      `Behavior contract ${plan.world.behaviorPath} cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+      "missing-behavior",
+    )
+  }
+  const missing = behaviorHeadings.filter((heading) => {
+    const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    return !new RegExp(`^#{1,6}\\s+${escaped}\\s*$`, "im").test(source)
+  })
+  if (missing.length > 0) {
+    throw new ContractValidationError(
+      `Behavior contract ${plan.world.behaviorPath} is missing headings: ${missing.join(", ")}`,
+      "incomplete-behavior",
+    )
+  }
+  const empty = behaviorHeadings.filter((heading) => {
+    const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    const match = new RegExp(`^#{1,6}\\s+${escaped}\\s*$`, "im").exec(source)
+    if (!match || match.index === undefined) return false
+    const start = match.index + match[0].length
+    const remainder = source.slice(start)
+    const nextHeading = /^#{1,6}\s+/m.exec(remainder)
+    return remainder.slice(0, nextHeading?.index ?? remainder.length).trim().length === 0
+  })
+  if (empty.length > 0) {
+    throw new ContractValidationError(
+      `Behavior contract ${plan.world.behaviorPath} has empty sections: ${empty.join(", ")}`,
+      "incomplete-behavior",
+    )
+  }
+}
+
+async function readBoundaryAsset(worktree: string, path: string, label: string): Promise<string> {
+  try {
+    const source = await readFile(resolveRepositoryPath(worktree, path), "utf8")
+    if (!source.trim()) throw new Error("file is empty")
+    return source
+  } catch (error) {
+    throw new ContractValidationError(
+      `${label} ${path} is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      "incomplete-world",
+    )
+  }
+}
+
+export async function assertBoundaryAssets(worktree: string, plan: NodePlan): Promise<void> {
+  const projectionSource = await readBoundaryAsset(worktree, plan.world.projectionPath, "Projection")
+  const expectedImports = [...plan.imports].sort()
+  const stubImports = plan.world.stubs.map((stub) => stub.interface).sort()
+  if (new Set(stubImports).size !== stubImports.length || JSON.stringify(stubImports) !== JSON.stringify(expectedImports)) {
+    throw new ContractValidationError(
+      `World ${plan.world.world} must provide exactly one stub for each import (${expectedImports.join(", ") || "none"})`,
+      "incomplete-world",
+    )
+  }
+  const stubSources = new Map(await Promise.all(plan.world.stubs.map(async (stub) => [
+    stub.interface,
+    await readBoundaryAsset(worktree, stub.path, `Stub for ${stub.interface}`),
+  ] as const)))
+  const typeScriptAssets = [...new Set([plan.world.projectionPath, ...plan.world.stubs.map((stub) => stub.path)])]
+    .filter((path) => /\.[cm]?tsx?$/.test(path))
+    .map((path) => resolveRepositoryPath(worktree, path))
+  let typeScriptProgram: ts.Program | undefined
+  if (typeScriptAssets.length > 0) {
+    typeScriptProgram = ts.createProgram({
+      rootNames: typeScriptAssets,
+      options: {
+        noEmit: true,
+        strict: true,
+        skipLibCheck: true,
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.NodeNext,
+        moduleResolution: ts.ModuleResolutionKind.NodeNext,
+        types: [],
+      },
+    })
+    const errors = ts.getPreEmitDiagnostics(typeScriptProgram)
+      .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
+    if (errors.length > 0) {
+      const detail = errors.slice(0, 5).map((diagnostic) => {
+        const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ")
+        if (!diagnostic.file || diagnostic.start === undefined) return message
+        const location = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start)
+        return `${relative(worktree, diagnostic.file.fileName)}:${location.line + 1}:${location.character + 1} ${message}`
+      }).join("; ")
+      throw new ContractValidationError(`TypeScript boundary projection failed: ${detail}`, "invalid-projection")
+    }
+  }
+
+  const bindingSource = await readBoundaryAsset(worktree, plan.world.bindingPath, "Binding")
+  let binding: unknown
+  try {
+    binding = JSON.parse(bindingSource)
+  } catch (error) {
+    throw new ContractValidationError(
+      `Binding ${plan.world.bindingPath} is not JSON: ${error instanceof Error ? error.message : String(error)}`,
+      "invalid-binding",
+    )
+  }
+  if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
+    throw new ContractValidationError(`Binding ${plan.world.bindingPath} must be an object`, "invalid-binding")
+  }
+  const value = binding as Record<string, unknown>
+  const exported = value.export
+  const imports = value.imports
+  const exportInterface = exported && typeof exported === "object" && !Array.isArray(exported)
+    ? (exported as Record<string, unknown>).interface
+    : undefined
+  const exportSymbol = exported && typeof exported === "object" && !Array.isArray(exported)
+    ? (exported as Record<string, unknown>).symbol
+    : undefined
+  const bindingImports = Array.isArray(imports)
+    ? imports.map((item) => item && typeof item === "object" && !Array.isArray(item)
+      ? (item as Record<string, unknown>)
+      : undefined)
+    : []
+  const bindingImportNames = bindingImports.map((item) => item?.interface).filter((item): item is string => typeof item === "string").sort()
+  const importsHaveSymbols = bindingImports.every((item) => typeof item?.symbol === "string" && item.symbol.length > 0)
+  if (
+    value.version !== 1
+    || value.world !== plan.world.world
+    || exportInterface !== plan.exports[0]
+    || typeof exportSymbol !== "string"
+    || exportSymbol.length === 0
+    || !Array.isArray(imports)
+    || bindingImportNames.length !== bindingImports.length
+    || !importsHaveSymbols
+    || JSON.stringify(bindingImportNames) !== JSON.stringify(expectedImports)
+  ) {
+    throw new ContractValidationError(
+      `Binding ${plan.world.bindingPath} must declare version 1, world ${plan.world.world}, export ${plan.exports[0]}, and exact imports`,
+      "invalid-binding",
+    )
+  }
+  const declaresSymbol = (path: string, source: string, symbol: string): boolean => {
+    if (typeScriptProgram && /\.[cm]?tsx?$/.test(path)) {
+      const sourceFile = typeScriptProgram.getSourceFile(resolveRepositoryPath(worktree, path))
+      const moduleSymbol = sourceFile ? typeScriptProgram.getTypeChecker().getSymbolAtLocation(sourceFile) : undefined
+      return moduleSymbol
+        ? typeScriptProgram.getTypeChecker().getExportsOfModule(moduleSymbol).some((item) => item.getName() === symbol)
+        : false
+    }
+    const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    return new RegExp(`(?:^|[^A-Za-z0-9_$])${escaped}(?:$|[^A-Za-z0-9_$])`, "m").test(source)
+  }
+  if (!declaresSymbol(plan.world.projectionPath, projectionSource, exportSymbol)) {
+    throw new ContractValidationError(
+      `Projection ${plan.world.projectionPath} does not declare bound export symbol ${exportSymbol}`,
+      "invalid-binding",
+    )
+  }
+  for (const imported of bindingImports) {
+    const interfaceName = imported?.interface as string
+    const symbol = imported?.symbol as string
+    const source = stubSources.get(interfaceName)
+    const stub = plan.world.stubs.find((item) => item.interface === interfaceName)
+    if (!source || !stub || !declaresSymbol(stub.path, source, symbol)) {
+      throw new ContractValidationError(
+        `Stub for ${interfaceName} does not declare bound import symbol ${symbol}`,
+        "invalid-binding",
+      )
+    }
+  }
+}
+
 // Quackery v0.1 deliberately accepts the local-interface WIT profile only.
 // jco is the canonical syntax/type authority; this extractor adds Quackery's
 // stricter one-world/one-hole and exact import/export policy.
@@ -236,4 +421,6 @@ export async function assertNodeWorldMatchesWit(worktree: string, plan: NodePlan
       throw new ContractValidationError(`WIT world ${plan.world.world} references missing interface ${name}`, "missing-interface")
     }
   }
+  await assertBehaviorContract(worktree, plan)
+  await assertBoundaryAssets(worktree, plan)
 }

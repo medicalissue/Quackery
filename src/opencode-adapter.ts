@@ -27,9 +27,41 @@ function dataOf(value: unknown): any {
   return value
 }
 
-function responseText(value: unknown): string {
+function failureMessage(value: unknown): string {
+  if (value instanceof Error) return value.message
+  if (typeof value === "string") return value
+  if (!value || typeof value !== "object") return String(value)
+  const record = value as Record<string, any>
+  const name = typeof record.name === "string" ? record.name : undefined
+  const message = typeof record.message === "string"
+    ? record.message
+    : typeof record.data?.message === "string"
+      ? record.data.message
+      : undefined
+  if (name && message) return `${name}: ${message}`
+  if (message) return message
+  try {
+    return JSON.stringify(value).slice(0, 1_000)
+  } catch {
+    return String(value)
+  }
+}
+
+export function responseFailure(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const outer = value as Record<string, any>
+  if (outer.error !== undefined && outer.error !== null) return failureMessage(outer.error)
   const data = dataOf(value)
-  const parts = data?.parts ?? data?.info?.parts ?? []
+  const assistantError = data?.info?.error ?? data?.message?.info?.error ?? data?.message?.error
+  return assistantError === undefined || assistantError === null ? undefined : failureMessage(assistantError)
+}
+
+function responseText(value: unknown): string {
+  if (typeof value === "string") return value
+  const data = dataOf(value)
+  if (typeof data?.output === "string") return data.output
+  if (typeof data?.message?.output === "string") return data.message.output
+  const parts = data?.parts ?? data?.info?.parts ?? data?.message?.parts ?? data?.message?.info?.parts ?? []
   return parts
     .filter((part: any) => part?.type === "text" && typeof part.text === "string")
     .map((part: any) => part.text)
@@ -37,10 +69,23 @@ function responseText(value: unknown): string {
 }
 
 export function parseJsonResponse(value: unknown): unknown {
-  const text = typeof value === "string" ? value : responseText(value)
+  const failure = responseFailure(value)
+  if (failure) throw new Error(`Agent request failed: ${failure}`)
+  const data = dataOf(value)
+  if (data && typeof data === "object" && typeof data.kind === "string") return data
+  if (data?.output && typeof data.output === "object") return data.output
+  const text = responseText(value)
   const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text)?.[1]
-  const candidate = fenced ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)
-  if (!candidate) throw new Error(`Agent did not return JSON: ${text.slice(-1_000)}`)
+  const firstBrace = text.indexOf("{")
+  const lastBrace = text.lastIndexOf("}")
+  const candidate = fenced ?? (firstBrace >= 0 && lastBrace >= firstBrace ? text.slice(firstBrace, lastBrace + 1) : "")
+  if (!candidate) {
+    const response = value && typeof value === "object" && "response" in value
+      ? (value as { response?: { status?: number; statusText?: string } }).response
+      : undefined
+    const status = response?.status ? ` (HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""})` : ""
+    throw new Error(`Agent returned no JSON text${status}`)
+  }
   try {
     return JSON.parse(candidate)
   } catch (error) {
@@ -53,6 +98,8 @@ export interface OpenCodeAdapterOptions {
   git: GitWorkspaceManager
   parentSessionId: string
   authorizeSession(sessionId: string, node: NodeContext, agent: "nurse" | "surgeon"): void
+  deauthorizeSession?(sessionId: string): void
+  workerEvidence?(nodeId: string): import("./model.js").VerificationEvidence[]
   cache: {
     enabled: boolean
     minFanout: number
@@ -63,12 +110,20 @@ export interface OpenCodeAdapterOptions {
     promptMs: number
     verificationMs: number
   }
+  protocolAttempts?: number
+  escalation?: Partial<Record<"nurse" | "surgeon", { model: string; variant?: string }>>
+  models?: Partial<Record<"nurse" | "surgeon", { model: string; variant?: string }>>
+  maxConcurrency?: number
+  maxObservedCost?: number
 }
 
 export class OpenCodeExecutionAdapter implements ExecutionAdapter {
   private readonly decompositionSessions = new Map<string, string>()
   private readonly boundaries = new Map<string, { seed: BoundaryCacheSeed; cacheRoles: Set<"nurse" | "surgeon"> }>()
   private readonly usage = new Map<string, ReturnType<typeof emptyUsage>>()
+  private readonly activeSessions = new Set<string>()
+  private activePrompts = 0
+  private readonly promptWaiters: Array<() => void> = []
 
   constructor(private readonly options: OpenCodeAdapterOptions) {}
 
@@ -77,8 +132,23 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     if (node.role !== "nurse") throw new Error(`Only a Nurse node may decompose; received ${node.role}`)
     const sessionId = await this.createSession(node, "nurse", `nurse · ${node.scope}`)
     this.decompositionSessions.set(node.id, sessionId)
-    const response = await this.prompt(node, sessionId, "nurse", decompositionPrompt(node))
-    return decompositionDecisionSchema.parse(parseJsonResponse(response))
+    return this.promptStructured(node, sessionId, "nurse", decompositionPrompt(node), decompositionDecisionSchema)
+  }
+
+  async reviseDecomposition(node: NodeContext, error: Error, attempt: number): Promise<DecompositionDecision> {
+    this.assertActive()
+    node.repair = { reason: "BOUNDARY_REJECTED", detail: error.message }
+    node.attempt = attempt
+    this.applyEscalation(node, "nurse")
+    const sessionId = this.decompositionSessions.get(node.id)
+    if (!sessionId) return this.decompose(node)
+    return this.promptStructured(
+      node,
+      sessionId,
+      "nurse",
+      `The runtime rejected your previous boundary:\n${error.message.slice(0, 2_000)}\n\nReturn one complete replacement decomposition JSON object in the previously required shape. If returning LEAF for an inherited plan, reuse its exports, imports, complete world object, artifacts, owns, and verify exactly and do not copy contract files. If returning SPLIT, correct only boundary artifacts under ${node.boundaryRoot}. Do not edit product code.`,
+      decompositionDecisionSchema,
+    )
   }
 
   async commitBoundary(node: NodeContext, decision: DecompositionDecision): Promise<string> {
@@ -99,6 +169,8 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     const commit = await this.options.git.commitAll(node.id, `quackery(${node.id}): freeze abstract worlds`)
     await this.options.git.assertOwned(node.id, node.baseCommit, [{ path: node.boundaryRoot, mode: "prefix" }], commit)
     this.seedBoundary(node, commit, decision)
+    const decompositionSession = this.decompositionSessions.get(node.id)
+    if (decompositionSession) this.releaseSession(decompositionSession)
     // The separate Surgeon created for a Nurse LEAF handoff must not inherit
     // the Nurse node's cache partition.
     if (decision.kind === "leaf") delete node.cache
@@ -122,10 +194,13 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     const id = `${parent.id}/${plan.id}`
     const record = await this.options.git.create(id, boundaryCommit)
     const role = plan.kind === "leaf" ? "surgeon" : "nurse"
+    const configuredModel = this.options.models?.[role]
+    const modelOverride = configuredModel ? this.modelTarget(configuredModel) : undefined
     const boundary = this.boundaries.get(parent.id)
     const cache = boundary?.cacheRoles.has(role) ? cacheContext(boundary.seed, role) : undefined
     return {
       id,
+      ...(parent.runId ? { runId: parent.runId } : {}),
       parentId: parent.id,
       depth: parent.depth + 1,
       role,
@@ -136,11 +211,30 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       boundaryRoot: this.options.git.boundaryRoot(id),
       ...(parent.intent ? { intent: parent.intent } : {}),
       ...(cache ? { cache } : {}),
+      ...(modelOverride ? { modelOverride } : {}),
     }
   }
 
   async prepareNeedsNurse(node: NodeContext): Promise<string | undefined> {
-    return this.options.git.stashUncommitted(node.id, `quackery(${node.id}): Surgeon attempt before NEEDS_NURSE`)
+    const stash = await this.options.git.stashUncommitted(node.id, `quackery(${node.id}): Surgeon attempt before NEEDS_NURSE`)
+    const head = await this.options.git.head(node.id)
+    if (head !== node.baseCommit) await this.options.git.detachAt(node.id, node.baseCommit)
+    const nurseModel = this.options.models?.nurse
+    if (nurseModel) node.modelOverride = this.modelTarget(nurseModel)
+    else delete node.modelOverride
+    return stash ?? (head === node.baseCommit ? undefined : head)
+  }
+
+  async prepareRetry(node: NodeContext, _failure: NodeResult, _nextAttempt: number): Promise<void> {
+    this.applyEscalation(node, "surgeon")
+  }
+
+  telemetry(node: NodeContext): Pick<NodeResult, "usage" | "evidence"> {
+    const evidence = this.workerEvidence(node.id)
+    return {
+      usage: this.nodeUsage(node.id),
+      ...(evidence.length ? { evidence } : {}),
+    }
   }
 
   async runLeaf(node: NodeContext, boundaryCommit: string): Promise<NodeResult> {
@@ -150,15 +244,27 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     await access(resolveRepositoryPath(node.worktree, node.plan.world.behaviorPath))
 
     const sessionId = await this.createSession(node, "surgeon", `surgeon · ${node.scope}`)
-    const response = await this.prompt(node, sessionId, "surgeon", implementationPrompt(node))
-    const agentResult = implementationResponseSchema.parse(parseJsonResponse(response))
+    let agentResult: z.infer<typeof implementationResponseSchema>
+    try {
+      agentResult = await this.promptStructured(
+        node,
+        sessionId,
+        "surgeon",
+        implementationPrompt(node),
+        implementationResponseSchema,
+      )
+    } finally {
+      this.releaseSession(sessionId)
+    }
     if (agentResult.kind !== "implemented") {
+      const evidence = this.workerEvidence(node.id)
       return {
         ok: false,
         nodeId: node.id,
         reason: agentResult.kind === "needs-nurse" ? "NEEDS_NURSE" : "CONTRACT_FAILURE",
         detail: agentResult.reason,
         actualDepth: 0,
+        ...(evidence.length ? { evidence } : {}),
         usage: this.nodeUsage(node.id),
       }
     }
@@ -175,6 +281,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: error instanceof Error ? error.message : String(error),
         recoverableCommit: committedHead,
         actualDepth: 0,
+        ...(this.workerEvidence(node.id).length ? { evidence: this.workerEvidence(node.id) } : {}),
         usage: this.nodeUsage(node.id),
       }
     }
@@ -193,6 +300,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: `Verification changed the worktree: ${verificationMutations.join(", ")}`,
         recoverableCommit: committedHead,
         actualDepth: 0,
+        evidence: [...this.workerEvidence(node.id), ...evidence],
         usage: this.nodeUsage(node.id),
       }
     }
@@ -205,6 +313,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: `${failedEvidence.command} exited with ${failedEvidence.exitCode}`,
         recoverableCommit: committedHead,
         actualDepth: 0,
+        evidence: [...this.workerEvidence(node.id), ...evidence],
         usage: this.nodeUsage(node.id),
       }
     }
@@ -220,7 +329,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       baseCommit: resultBase,
       headCommit: normalized,
       changedPaths,
-      evidence,
+      evidence: [...this.workerEvidence(node.id), ...evidence],
       actualDepth: 0,
       usage: this.nodeUsage(node.id),
     }
@@ -250,6 +359,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       node.id,
       decision.join.verify,
       this.boundedTimeout(this.options.timeouts?.verificationMs ?? 120_000),
+      "runtime-join",
     )
     this.assertActive()
     const verificationMutations = await this.options.git.worktreeChanges(node.id)
@@ -261,6 +371,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: `Verification changed the worktree: ${verificationMutations.join(", ")}`,
         recoverableCommit: committedHead,
         actualDepth: 0,
+        evidence: [...this.workerEvidence(node.id), ...evidence],
         usage: this.nodeUsage(node.id),
       }
     }
@@ -273,6 +384,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
         detail: `${failedEvidence.command} exited with ${failedEvidence.exitCode}`,
         recoverableCommit: committedHead,
         actualDepth: 0,
+        evidence: [...this.workerEvidence(node.id), ...evidence],
         usage: this.nodeUsage(node.id),
       }
     }
@@ -289,8 +401,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       headCommit: normalized,
       changedPaths,
       evidence: [
-        ...children.flatMap((child) => child.evidence),
-        ...(integrationResult?.evidence ?? []),
+        ...this.workerEvidence(node.id),
         ...evidence,
       ],
       actualDepth: 0,
@@ -308,7 +419,14 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     if (decision.kind === "leaf" && node.plan) return
     const boundary = { path: node.boundaryRoot, mode: "prefix" as const }
     for (const plan of plans) {
-      for (const path of [plan.world.witPath, plan.world.behaviorPath, ...(plan.artifacts ?? [])]) {
+      for (const path of [
+        plan.world.witPath,
+        plan.world.behaviorPath,
+        plan.world.projectionPath,
+        plan.world.bindingPath,
+        ...plan.world.stubs.map((stub) => stub.path),
+        ...(plan.artifacts ?? []),
+      ]) {
         const candidate = relative(node.worktree, resolveRepositoryPath(node.worktree, path)).replaceAll("\\", "/")
         if (!ownershipContains(boundary, candidate)) {
           throw new Error(`Boundary artifact ${candidate} must be under ${node.boundaryRoot}`)
@@ -341,35 +459,141 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     } finally {
       request.dispose()
     }
+    const failure = responseFailure(response)
+    if (failure) throw new Error(`OpenCode session creation failed for ${node.id}: ${failure}`)
     const data = dataOf(response)
     const sessionId = data?.id
     if (typeof sessionId !== "string") throw new Error(`OpenCode did not return a session id for ${node.id}`)
     this.options.authorizeSession(sessionId, node, agent)
+    this.activeSessions.add(sessionId)
     return sessionId
   }
 
+  dispose(): void {
+    for (const sessionId of this.activeSessions) this.options.deauthorizeSession?.(sessionId)
+    this.activeSessions.clear()
+  }
+
+  private releaseSession(sessionId: string): void {
+    if (!this.activeSessions.delete(sessionId)) return
+    this.options.deauthorizeSession?.(sessionId)
+  }
+
   private async prompt(node: NodeContext, sessionId: string, agent: string, text: string): Promise<unknown> {
-    const request = this.requestSignal()
-    let response: unknown
+    await this.acquirePromptSlot()
     try {
-      response = await this.options.client.session.prompt({
-        path: { id: sessionId },
-        query: { directory: node.worktree },
-        body: {
-          agent,
-          parts: [{ type: "text", text }],
-        },
-        signal: request.signal,
-      })
+      this.assertObservedBudget()
+      const request = this.requestSignal()
+      let response: unknown
+      try {
+        response = await this.options.client.session.prompt({
+          path: { id: sessionId },
+          query: { directory: node.worktree },
+          body: {
+            agent,
+            ...(node.modelOverride
+              ? {
+                  model: {
+                    providerID: node.modelOverride.providerID,
+                    modelID: node.modelOverride.modelID,
+                  },
+                  ...(node.modelOverride.variant ? { variant: node.modelOverride.variant } : {}),
+                }
+              : {}),
+            parts: [{ type: "text", text }],
+          },
+          signal: request.signal,
+        })
+      } finally {
+        request.dispose()
+      }
+      this.usage.set(node.id, addUsage(this.nodeUsage(node.id), usageFromResponse(response)))
+      return response
     } finally {
-      request.dispose()
+      this.releasePromptSlot()
     }
-    this.usage.set(node.id, addUsage(this.nodeUsage(node.id), usageFromResponse(response)))
-    return response
+  }
+
+  private async promptStructured<T>(
+    node: NodeContext,
+    sessionId: string,
+    agent: "nurse" | "surgeon",
+    text: string,
+    schema: z.ZodType<T>,
+  ): Promise<T> {
+    const attempts = Math.max(1, this.options.protocolAttempts ?? 2)
+    let prompt = text
+    let lastError: unknown
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const response = await this.prompt(node, sessionId, agent, prompt)
+      try {
+        return schema.parse(parseJsonResponse(response))
+      } catch (error) {
+        if (responseFailure(response)) throw error
+        lastError = error
+        if (attempt === attempts) break
+        const detail = error instanceof Error ? error.message : String(error)
+        prompt = `Your previous response violated the required structured protocol:\n${detail.slice(0, 1_500)}\n\nDo not explain or call tools. Return exactly one JSON object in one of the shapes from the prior instructions.`
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
   }
 
   private nodeUsage(nodeId: string): ReturnType<typeof emptyUsage> {
     return this.usage.get(nodeId) ?? emptyUsage()
+  }
+
+  private workerEvidence(nodeId: string): import("./model.js").VerificationEvidence[] {
+    return this.options.workerEvidence?.(nodeId) ?? []
+  }
+
+  private applyEscalation(node: NodeContext, role: "nurse" | "surgeon"): void {
+    const target = this.options.escalation?.[role]
+    if (!target) return
+    node.modelOverride = this.modelTarget(target)
+  }
+
+  private modelTarget(target: { model: string; variant?: string }): NonNullable<NodeContext["modelOverride"]> {
+    const separator = target.model.indexOf("/")
+    if (separator <= 0 || separator === target.model.length - 1) {
+      throw new Error(`Escalation model must use provider/model form: ${target.model}`)
+    }
+    return {
+      providerID: target.model.slice(0, separator),
+      modelID: target.model.slice(separator + 1),
+      ...(target.variant ? { variant: target.variant } : {}),
+    }
+  }
+
+  private async acquirePromptSlot(): Promise<void> {
+    this.assertActive()
+    const limit = Math.max(1, this.options.maxConcurrency ?? Number.POSITIVE_INFINITY)
+    if (this.activePrompts >= limit) {
+      await new Promise<void>((resolve) => this.promptWaiters.push(resolve))
+      try {
+        this.assertActive()
+      } catch (error) {
+        this.releasePromptSlot()
+        throw error
+      }
+      return
+    }
+    this.activePrompts += 1
+  }
+
+  private releasePromptSlot(): void {
+    const next = this.promptWaiters.shift()
+    if (next) next()
+    else this.activePrompts = Math.max(0, this.activePrompts - 1)
+  }
+
+  private assertObservedBudget(): void {
+    const limit = this.options.maxObservedCost ?? 0
+    if (limit <= 0) return
+    const observed = [...this.usage.values()].reduce((total, usage) => total + usage.cost, 0)
+    if (observed >= limit) {
+      throw new Error(`Observed provider cost $${observed.toFixed(4)} reached limit $${limit.toFixed(4)}`)
+    }
   }
 
   private assertActive(): void {

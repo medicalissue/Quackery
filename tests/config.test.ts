@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { agentConfiguration } from "../src/index.js"
-import { configuredRoleModel, loadQuackConfig } from "../src/config.js"
+import { configuredRoleModel, escalationRoleModel, loadQuackConfig } from "../src/config.js"
 
 test("loads JSONC config with local overrides and profile role defaults", async () => {
   const root = await mkdtemp(join(tmpdir(), "quack-config-"))
@@ -34,6 +34,11 @@ test("loads JSONC config with local overrides and profile role defaults", async 
       maxDepth: 7,
       maxNodes: 12,
       maxNeedsNurseBounces: 1,
+      maxLeafAttempts: 2,
+      maxDecompositionAttempts: 2,
+      maxJoinAttempts: 2,
+      maxConcurrency: 4,
+      maxObservedCost: 0,
       maxRunSeconds: 3_600,
       maxPromptSeconds: 600,
       verificationSeconds: 120,
@@ -90,6 +95,33 @@ test("rejects invalid project policy instead of silently falling back", async ()
     await mkdir(join(root, ".quack"))
     await writeFile(join(root, ".quack", "config.jsonc"), `{ "cache": { "minFanout": 1 } }`)
     expect(loadQuackConfig(root)).rejects.toThrow()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("selects the next configured quality tier for a local retry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "quack-escalation-"))
+  try {
+    await mkdir(join(root, ".quack"))
+    await writeFile(join(root, ".quack", "config.jsonc"), `{
+      "profile": "balanced",
+      "models": {
+        "economy": { "model": "provider/economy" },
+        "balanced": { "model": "provider/balanced", "variant": "high" },
+        "strong": { "model": "provider/strong" }
+      }
+    }`)
+    const config = await loadQuackConfig(root)
+    expect(escalationRoleModel(config, "surgeon")).toMatchObject({
+      tier: "balanced",
+      model: "provider/balanced",
+      variant: "high",
+    })
+    expect(escalationRoleModel(config, "nurse")).toMatchObject({
+      tier: "strong",
+      model: "provider/strong",
+    })
   } finally {
     await rm(root, { recursive: true, force: true })
   }
